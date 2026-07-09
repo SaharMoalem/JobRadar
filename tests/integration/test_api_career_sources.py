@@ -2,11 +2,12 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from apps.api.main import create_app
+from tests.support.fake_compliance_check_adapter import FakeComplianceCheckAdapter
 
 
 @pytest.fixture
 def app():
-    return create_app()
+    return create_app(compliance_checker=FakeComplianceCheckAdapter())
 
 
 @pytest.fixture
@@ -25,6 +26,10 @@ async def test_api_envelope_and_lifecycle(client):
     payload = created.json()
     assert payload["error"] is None
     source_id = payload["data"]["id"]
+
+    approved = await client.post(f"/career-sources/{source_id}/compliance/approve")
+    assert approved.status_code == 200
+    assert approved.json()["data"]["compliance_status"] == "approved"
 
     enabled = await client.post(f"/career-sources/{source_id}/enable")
     assert enabled.status_code == 200
@@ -53,7 +58,7 @@ async def test_api_not_found_returns_404(client):
 
 @pytest.mark.anyio
 async def test_api_enable_limit_returns_409():
-    app = create_app(max_enabled_sources=1)
+    app = create_app(max_enabled_sources=1, compliance_checker=FakeComplianceCheckAdapter())
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         first = await client.post(
             "/career-sources",
@@ -63,7 +68,9 @@ async def test_api_enable_limit_returns_409():
             "/career-sources",
             json={"name": "B", "base_url": "https://b.example.com"},
         )
+        await client.post(f"/career-sources/{first.json()['data']['id']}/compliance/approve")
         await client.post(f"/career-sources/{first.json()['data']['id']}/enable")
+        await client.post(f"/career-sources/{second.json()['data']['id']}/compliance/approve")
         limit_response = await client.post(f"/career-sources/{second.json()['data']['id']}/enable")
     assert limit_response.status_code == 409
     assert limit_response.json()["error"]["code"] == "SOURCE_ENABLED_LIMIT_EXCEEDED"

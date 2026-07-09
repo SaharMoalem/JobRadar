@@ -10,6 +10,12 @@ class CareerSourceStatus(str, Enum):
     DISABLED = "disabled"
 
 
+class ComplianceStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -20,6 +26,10 @@ class CareerSource:
     name: str
     base_url: str
     status: CareerSourceStatus = CareerSourceStatus.DISABLED
+    compliance_status: ComplianceStatus = ComplianceStatus.PENDING
+    compliance_reason: str | None = None
+    robots_check_passed: bool | None = None
+    compliance_reviewed_at: datetime | None = None
     created_at: datetime = field(default_factory=_utc_now)
     updated_at: datetime = field(default_factory=_utc_now)
 
@@ -28,4 +38,17 @@ class CareerSource:
 
     def set_status(self, status: CareerSourceStatus) -> None:
         self.status = status
+        self.touch()
+
+    def set_compliance(
+        self,
+        *,
+        status: ComplianceStatus,
+        reason: str | None,
+        robots_check_passed: bool | None,
+    ) -> None:
+        self.compliance_status = status
+        self.compliance_reason = reason
+        self.robots_check_passed = robots_check_passed
+        self.compliance_reviewed_at = _utc_now()
         self.touch()

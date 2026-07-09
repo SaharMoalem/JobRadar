@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import uuid4
 
-from src.domain.career_source import CareerSource, CareerSourceStatus
+from src.domain.career_source import CareerSource, CareerSourceStatus, ComplianceStatus
+from src.domain.compliance_policy import require_compliance_approved
 from src.domain.source_policy import (
     SourcePolicyConfig,
     SourceValidationError,
@@ -28,8 +29,17 @@ class CareerSourceService:
         source = self.repository.get(source_id)
         if source is None:
             raise SourceValidationError("SOURCE_NOT_FOUND", "Career source not found.")
+        normalized_url = base_url.strip()
+        if normalized_url != source.base_url and source.compliance_status != ComplianceStatus.PENDING:
+            source.set_compliance(
+                status=ComplianceStatus.PENDING,
+                reason="base_url_changed",
+                robots_check_passed=None,
+            )
+            if source.status == CareerSourceStatus.ENABLED:
+                source.set_status(CareerSourceStatus.DISABLED)
         source.name = name.strip()
-        source.base_url = base_url.strip()
+        source.base_url = normalized_url
         source.touch()
         return self.repository.update(source)
 
@@ -37,6 +47,7 @@ class CareerSourceService:
         source = self.repository.get(source_id)
         if source is None:
             raise SourceValidationError("SOURCE_NOT_FOUND", "Career source not found.")
+        require_compliance_approved(source)
         enforce_enable_limit(
             current_enabled_count=self.repository.count_enabled(),
             source=source,
