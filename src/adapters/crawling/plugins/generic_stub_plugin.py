@@ -14,6 +14,9 @@ class GenericStubCrawlerPlugin:
             url=source.base_url,
             raw_payload={
                 "source_name": source.name,
+                "company": source.name,
+                "location": "Tel Aviv, Israel",
+                "posted_at": "2026-07-01T08:00:00+00:00",
                 "correlation_id": correlation_id,
                 "plugin_id": self.plugin_id,
             },

@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 
+from src.domain.job_posting import JobPosting
+from src.domain.normalization import NormalizationRejection
+
 
 class SourceCrawlStatus(str, Enum):
     SUCCEEDED = "succeeded"
@@ -37,6 +40,8 @@ class SourceCrawlOutcome:
     error_code: str | None = None
     error_message: str | None = None
     duration_ms: int = 0
+    job_postings: tuple[JobPosting, ...] = ()
+    normalization_rejections: tuple[NormalizationRejection, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

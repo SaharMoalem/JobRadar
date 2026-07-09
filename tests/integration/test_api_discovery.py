@@ -53,6 +53,8 @@ async def test_execute_returns_crawl_outcome(client):
     assert payload["data"]["status"] == "succeeded"
     assert payload["data"]["plugin_id"] == "generic"
     assert len(payload["data"]["records"]) == 1
+    assert len(payload["data"]["job_postings"]) == 1
+    assert payload["data"]["job_postings"][0]["completeness"] == "complete"
 
 
 @pytest.mark.anyio

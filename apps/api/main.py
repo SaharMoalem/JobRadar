@@ -5,13 +5,20 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.adapters.compliance.http_robots_compliance_adapter import HttpRobotsComplianceAdapter
+from src.adapters.crawling.normalizer_registry import InMemoryCrawlNormalizerRegistry
+from src.adapters.crawling.normalizers.generic_stub_normalizer import GenericStubCrawlNormalizer
 from src.adapters.crawling.plugin_registry import InMemoryCrawlerPluginRegistry
 from src.adapters.crawling.plugins.generic_stub_plugin import GenericStubCrawlerPlugin
 from src.adapters.persistence.in_memory_career_source_adapter import InMemoryCareerSourceAdapter
+from src.adapters.persistence.in_memory_job_posting_adapter import InMemoryJobPostingAdapter
+from src.application.ingestion.enrich_crawl_outcome import CrawlNormalizationService
+from src.application.ingestion.normalize_records import NormalizeCrawlRecordsUseCase
 from src.application.use_cases.career_source import CareerSourceService
 from src.application.use_cases.discover_jobs import DiscoverJobsUseCase
 from src.application.use_cases.source_compliance import SourceComplianceService
 from src.domain.crawl import CrawlRunResult, SourceCrawlOutcome, SourceCrawlStatus
+from src.domain.job_posting import JobPosting
+from src.domain.normalization import NormalizationRejection
 from src.domain.source_policy import SourcePolicyConfig, SourceValidationError
 from src.ports.compliance_check_port import ComplianceCheckPort
 from src.ports.crawler_plugin_port import CrawlerPluginPort
@@ -62,6 +69,8 @@ class SourceCrawlOutcomeResponse(BaseModel):
     plugin_id: str
     status: str
     records: list[RawCrawlRecordResponse] = Field(default_factory=list)
+    job_postings: list[JobPostingResponse] = Field(default_factory=list)
+    normalization_rejections: list[NormalizationRejectionResponse] = Field(default_factory=list)
     error_code: str | None = None
     error_message: str | None = None
     duration_ms: int = 0
@@ -72,6 +81,27 @@ class CrawlRunResponse(BaseModel):
     outcomes: list[SourceCrawlOutcomeResponse]
     succeeded_count: int
     failed_count: int
+
+
+class JobPostingResponse(BaseModel):
+    id: str
+    title: str
+    company: str
+    location: str
+    url: str
+    posted_at: str | None
+    career_source_id: str
+    external_id: str
+    plugin_id: str
+    completeness: str
+
+
+class NormalizationRejectionResponse(BaseModel):
+    external_id: str
+    career_source_id: str
+    plugin_id: str
+    reason: str
+    missing_fields: list[str]
 
 
 def envelope(*, data=None, error=None, meta=None):
@@ -109,6 +139,31 @@ def crawl_outcome_response(outcome: SourceCrawlOutcome, *, correlation_id: str) 
     )
 
 
+def _job_posting_to_dict(posting: JobPosting) -> dict:
+    return JobPostingResponse(
+        id=posting.id,
+        title=posting.title,
+        company=posting.company,
+        location=posting.location,
+        url=posting.url,
+        posted_at=posting.posted_at.isoformat() if posting.posted_at else None,
+        career_source_id=posting.career_source_id,
+        external_id=posting.external_id,
+        plugin_id=posting.plugin_id,
+        completeness=posting.completeness.value,
+    ).model_dump()
+
+
+def _rejection_to_dict(rejection: NormalizationRejection) -> dict:
+    return NormalizationRejectionResponse(
+        external_id=rejection.external_id,
+        career_source_id=rejection.career_source_id,
+        plugin_id=rejection.plugin_id,
+        reason=rejection.reason,
+        missing_fields=list(rejection.missing_fields),
+    ).model_dump()
+
+
 def _outcome_to_dict(outcome: SourceCrawlOutcome) -> dict:
     return SourceCrawlOutcomeResponse(
         source_id=outcome.source_id,
@@ -122,6 +177,10 @@ def _outcome_to_dict(outcome: SourceCrawlOutcome) -> dict:
                 raw_payload=record.raw_payload,
             )
             for record in outcome.records
+        ],
+        job_postings=[_job_posting_to_dict(posting) for posting in outcome.job_postings],
+        normalization_rejections=[
+            _rejection_to_dict(rejection) for rejection in outcome.normalization_rejections
         ],
         error_code=outcome.error_code,
         error_message=outcome.error_message,
@@ -138,6 +197,16 @@ def _run_to_dict(run: CrawlRunResult) -> dict:
     ).model_dump()
 
 
+def _build_normalizer_registry(
+    extra_plugins: list[CrawlerPluginPort] | None = None,
+) -> InMemoryCrawlNormalizerRegistry:
+    normalizer = GenericStubCrawlNormalizer()
+    plugin_ids = {"generic"}
+    for plugin in extra_plugins or []:
+        plugin_ids.add(plugin.plugin_id)
+    return InMemoryCrawlNormalizerRegistry({plugin_id: normalizer for plugin_id in plugin_ids})
+
+
 def _build_plugin_registry(extra_plugins: list[CrawlerPluginPort] | None = None) -> InMemoryCrawlerPluginRegistry:
     registry = InMemoryCrawlerPluginRegistry({"generic": GenericStubCrawlerPlugin()})
     for plugin in extra_plugins or []:
@@ -150,9 +219,11 @@ def create_app(
     max_enabled_sources: int = 50,
     compliance_checker: ComplianceCheckPort | None = None,
     extra_plugins: list[CrawlerPluginPort] | None = None,
+    job_posting_repository: InMemoryJobPostingAdapter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JobRadar API")
     repository = InMemoryCareerSourceAdapter()
+    postings = job_posting_repository or InMemoryJobPostingAdapter()
     service = CareerSourceService(
         repository=repository,
         config=SourcePolicyConfig(max_enabled_sources=max_enabled_sources),
@@ -162,9 +233,17 @@ def create_app(
         compliance_checker=compliance_checker or HttpRobotsComplianceAdapter(),
     )
     plugin_registry = _build_plugin_registry(extra_plugins)
+    normalizer_registry = _build_normalizer_registry(extra_plugins)
+    normalize_use_case = NormalizeCrawlRecordsUseCase(job_posting_repository=postings)
+    normalization_service = CrawlNormalizationService(
+        repository=repository,
+        normalizer_registry=normalizer_registry,
+        normalize_use_case=normalize_use_case,
+    )
     discovery_service = DiscoverJobsUseCase(
         repository=repository,
         plugin_registry=plugin_registry,
+        normalization_service=normalization_service,
     )
 
     @app.post("/career-sources")
@@ -240,6 +319,11 @@ def create_app(
             data=_run_to_dict(run),
             meta={"correlation_id": x_correlation_id},
         )
+
+    @app.get("/job-postings")
+    def list_job_postings():
+        items = [_job_posting_to_dict(posting) for posting in postings.list_complete()]
+        return envelope(data=items)
 
     return app
 
