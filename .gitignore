@@ -30,5 +30,5 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Local checkpoint gate state (review gate toggles per session)
-.cursor/checkpoint/review_gate.json
+# Cursor (hooks, checkpoint gate, local IDE state)
+.cursor/
