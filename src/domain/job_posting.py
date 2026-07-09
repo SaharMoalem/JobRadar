@@ -25,6 +25,7 @@ class JobPosting:
     career_source_id: str
     external_id: str
     plugin_id: str
+    identity_key: str | None = None
     completeness: JobPostingCompleteness = JobPostingCompleteness.COMPLETE
     rejection_reason: str | None = None
     source_metadata: dict[str, object] = field(default_factory=dict)

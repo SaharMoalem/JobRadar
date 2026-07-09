@@ -93,7 +93,17 @@ class JobPostingResponse(BaseModel):
     career_source_id: str
     external_id: str
     plugin_id: str
+    identity_key: str | None = None
     completeness: str
+
+
+class JobDuplicateLinkResponse(BaseModel):
+    canonical_id: str
+    identity_key: str
+    career_source_id: str
+    external_id: str
+    duplicate_reason: str
+    suppressed_at: str
 
 
 class NormalizationRejectionResponse(BaseModel):
@@ -150,7 +160,19 @@ def _job_posting_to_dict(posting: JobPosting) -> dict:
         career_source_id=posting.career_source_id,
         external_id=posting.external_id,
         plugin_id=posting.plugin_id,
+        identity_key=posting.identity_key,
         completeness=posting.completeness.value,
+    ).model_dump()
+
+
+def _duplicate_link_to_dict(link) -> dict:
+    return JobDuplicateLinkResponse(
+        canonical_id=link.canonical_id,
+        identity_key=link.identity_key,
+        career_source_id=link.career_source_id,
+        external_id=link.external_id,
+        duplicate_reason=link.duplicate_reason,
+        suppressed_at=link.suppressed_at.isoformat(),
     ).model_dump()
 
 
@@ -323,6 +345,11 @@ def create_app(
     @app.get("/job-postings")
     def list_job_postings():
         items = [_job_posting_to_dict(posting) for posting in postings.list_complete()]
+        return envelope(data=items)
+
+    @app.get("/job-duplicate-links")
+    def list_job_duplicate_links():
+        items = [_duplicate_link_to_dict(link) for link in postings.list_duplicate_links()]
         return envelope(data=items)
 
     return app
