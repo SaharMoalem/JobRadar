@@ -25,6 +25,7 @@ class CareerSource:
     id: str
     name: str
     base_url: str
+    plugin_id: str = "generic"
     status: CareerSourceStatus = CareerSourceStatus.DISABLED
     compliance_status: ComplianceStatus = ComplianceStatus.PENDING
     compliance_reason: str | None = None

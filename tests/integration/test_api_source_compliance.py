@@ -65,4 +65,5 @@ async def test_compliance_approve_enable_execute_flow(client):
         headers={"x-correlation-id": "corr-api-2"},
     )
     assert executed.status_code == 200
-    assert executed.json()["meta"]["execution"] == "accepted"
+    assert executed.json()["data"]["status"] == "succeeded"
+    assert executed.json()["data"]["plugin_id"] == "generic"

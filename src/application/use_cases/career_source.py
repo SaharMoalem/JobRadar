@@ -19,12 +19,24 @@ class CareerSourceService:
     repository: CareerSourceRepositoryPort
     config: SourcePolicyConfig
 
-    def create(self, name: str, base_url: str) -> CareerSource:
+    def create(self, name: str, base_url: str, *, plugin_id: str = "generic") -> CareerSource:
         validate_source_fields(name, base_url)
-        source = CareerSource(id=str(uuid4()), name=name.strip(), base_url=base_url.strip())
+        source = CareerSource(
+            id=str(uuid4()),
+            name=name.strip(),
+            base_url=base_url.strip(),
+            plugin_id=plugin_id.strip() or "generic",
+        )
         return self.repository.create(source)
 
-    def update(self, source_id: str, name: str, base_url: str) -> CareerSource:
+    def update(
+        self,
+        source_id: str,
+        name: str,
+        base_url: str,
+        *,
+        plugin_id: str | None = None,
+    ) -> CareerSource:
         validate_source_fields(name, base_url)
         source = self.repository.get(source_id)
         if source is None:
@@ -38,6 +50,8 @@ class CareerSourceService:
             )
             if source.status == CareerSourceStatus.ENABLED:
                 source.set_status(CareerSourceStatus.DISABLED)
+        if plugin_id is not None:
+            source.plugin_id = plugin_id.strip() or "generic"
         source.name = name.strip()
         source.base_url = normalized_url
         source.touch()
