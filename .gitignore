@@ -1,0 +1,34 @@
+# BMad Method (framework, skills, generated artifacts)
+_bmad/
+_bmad-output/
+.agents/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local checkpoint gate state (review gate toggles per session)
+.cursor/checkpoint/review_gate.json

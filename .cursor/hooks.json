@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "uv run --python 3.11 .cursor/hooks/git_gate.py",
+        "matcher": "^\\s*git\\s+(commit|push)\\b",
+        "failClosed": true
+      }
+    ]
+  }
+}
