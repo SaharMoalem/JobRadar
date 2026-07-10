@@ -9,6 +9,9 @@ from src.adapters.crawling.normalizer_registry import InMemoryCrawlNormalizerReg
 from src.adapters.crawling.normalizers.generic_stub_normalizer import GenericStubCrawlNormalizer
 from src.adapters.crawling.plugin_registry import InMemoryCrawlerPluginRegistry
 from src.adapters.crawling.plugins.generic_stub_plugin import GenericStubCrawlerPlugin
+from src.adapters.observability.structured_precision_telemetry_adapter import (
+    StructuredPrecisionTelemetryAdapter,
+)
 from src.adapters.observability.structured_gating_telemetry_adapter import (
     StructuredGatingTelemetryAdapter,
 )
@@ -25,6 +28,12 @@ from src.adapters.persistence.in_memory_match_score_adapter import InMemoryMatch
 from src.adapters.persistence.in_memory_recommendation_gate_config_adapter import (
     InMemoryRecommendationGateConfigAdapter,
 )
+from src.adapters.persistence.in_memory_precision_policy_config_adapter import (
+    InMemoryPrecisionPolicyConfigAdapter,
+)
+from src.adapters.persistence.in_memory_top_recommendation_adapter import (
+    InMemoryTopRecommendationAdapter,
+)
 from src.adapters.persistence.in_memory_user_profile_adapter import InMemoryUserProfileAdapter
 from src.adapters.persistence.in_memory_career_source_adapter import InMemoryCareerSourceAdapter
 from src.adapters.persistence.in_memory_job_posting_adapter import InMemoryJobPostingAdapter
@@ -32,8 +41,10 @@ from src.application.ingestion.enrich_crawl_outcome import CrawlNormalizationSer
 from src.application.ingestion.normalize_records import NormalizeCrawlRecordsUseCase
 from src.application.ingestion.track_lifecycle import JobLifecycleService
 from src.application.use_cases.apply_actionable_gating import ApplyActionableGatingUseCase
+from src.application.use_cases.apply_precision_policy import ApplyPrecisionPolicyUseCase
 from src.application.use_cases.career_source import CareerSourceService
 from src.application.use_cases.discover_jobs import DiscoverJobsUseCase
+from src.application.use_cases.precision_policy_config import PrecisionPolicyConfigService
 from src.application.use_cases.recommendation_gate_config import RecommendationGateConfigService
 from src.application.use_cases.score_job_postings import ScoreJobPostingsUseCase
 from src.application.use_cases.user_profile import UserProfileService
@@ -42,6 +53,11 @@ from src.domain.crawl import CrawlRunResult, SourceCrawlOutcome, SourceCrawlStat
 from src.domain.job_posting import JobPosting
 from src.domain.match_scoring import ScoringBatchResult, ScoringFailure
 from src.domain.normalization import NormalizationRejection
+from src.domain.precision_policy import (
+    PrecisionBatchResult,
+    PrecisionFailure,
+    PrecisionValidationError,
+)
 from src.domain.recommendation_gating import GatingBatchResult, GatingFailure, GatingValidationError
 from src.domain.source_policy import SourcePolicyConfig, SourceValidationError
 from src.ports.compliance_check_port import ComplianceCheckPort
@@ -62,6 +78,8 @@ ERROR_STATUS_BY_CODE: dict[str, int] = {
     "GATE_THRESHOLD_OUT_OF_RANGE": 400,
     "GATE_SKILL_OVERLAP_OUT_OF_RANGE": 400,
     "GATE_RECENCY_WINDOW_INVALID": 400,
+    "PRECISION_MIN_CONFIDENCE_OUT_OF_RANGE": 400,
+    "PRECISION_MAX_TOP_OUT_OF_RANGE": 400,
 }
 
 
@@ -248,6 +266,38 @@ class GatingFailureResponse(BaseModel):
     message: str
 
 
+class PrecisionPolicyConfigRequest(BaseModel):
+    min_confidence_for_top: int = 85
+    max_top_count: int = 10
+    config_version: str = "v1"
+
+
+class PrecisionPolicyConfigResponse(BaseModel):
+    config_version: str
+    min_confidence_for_top: int
+    max_top_count: int
+
+
+class TopRecommendationResponse(BaseModel):
+    job_posting_id: str
+    match_score: int
+    rank: int | None
+    suppressed: bool
+    suppression_reason: str | None
+    policy_version: str
+    gate_config_version: str
+    profile_version: str
+    evaluated_at: str
+
+
+class PrecisionBatchResponse(BaseModel):
+    top_count: int
+    suppressed_low_confidence_count: int
+    suppressed_capacity_count: int
+    actionable_input_count: int
+    top_recommendations: list[TopRecommendationResponse]
+
+
 def envelope(*, data=None, error=None, meta=None):
     return {"data": data, "error": error, "meta": meta or {}}
 
@@ -419,6 +469,60 @@ def gating_error_response(exc: GatingValidationError) -> JSONResponse:
     )
 
 
+def _precision_config_to_dict(config) -> dict:
+    return PrecisionPolicyConfigResponse(
+        config_version=config.config_version,
+        min_confidence_for_top=config.min_confidence_for_top,
+        max_top_count=config.max_top_count,
+    ).model_dump()
+
+
+def _top_recommendation_to_dict(recommendation) -> dict:
+    return TopRecommendationResponse(
+        job_posting_id=recommendation.job_posting_id,
+        match_score=recommendation.match_score,
+        rank=recommendation.rank,
+        suppressed=recommendation.suppressed,
+        suppression_reason=recommendation.suppression_reason,
+        policy_version=recommendation.policy_version,
+        gate_config_version=recommendation.gate_config_version,
+        profile_version=recommendation.profile_version,
+        evaluated_at=recommendation.evaluated_at.isoformat(),
+    ).model_dump()
+
+
+def _precision_result_response(result: PrecisionBatchResult | PrecisionFailure, *, correlation_id: str):
+    if isinstance(result, PrecisionFailure):
+        status_code = ERROR_STATUS_BY_CODE.get(result.code, 400)
+        return JSONResponse(
+            status_code=status_code,
+            content=envelope(
+                error={"code": result.code, "message": result.message},
+                meta={"correlation_id": correlation_id},
+            ),
+        )
+    return envelope(
+        data=PrecisionBatchResponse(
+            top_count=result.top_count,
+            suppressed_low_confidence_count=result.suppressed_low_confidence_count,
+            suppressed_capacity_count=result.suppressed_capacity_count,
+            actionable_input_count=result.actionable_input_count,
+            top_recommendations=[
+                _top_recommendation_to_dict(item) for item in result.top_recommendations if not item.suppressed
+            ],
+        ).model_dump(),
+        meta={"correlation_id": correlation_id},
+    )
+
+
+def precision_error_response(exc: PrecisionValidationError) -> JSONResponse:
+    status_code = ERROR_STATUS_BY_CODE.get(exc.code, 400)
+    return JSONResponse(
+        status_code=status_code,
+        content=envelope(error={"code": exc.code, "message": str(exc)}),
+    )
+
+
 def _duplicate_link_to_dict(link) -> dict:
     return JobDuplicateLinkResponse(
         canonical_id=link.canonical_id,
@@ -503,17 +607,23 @@ def create_app(
     gate_config_repository: InMemoryRecommendationGateConfigAdapter | None = None,
     gated_recommendation_repository: InMemoryGatedRecommendationAdapter | None = None,
     gating_telemetry: StructuredGatingTelemetryAdapter | None = None,
+    precision_config_repository: InMemoryPrecisionPolicyConfigAdapter | None = None,
+    top_recommendation_repository: InMemoryTopRecommendationAdapter | None = None,
+    precision_telemetry: StructuredPrecisionTelemetryAdapter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JobRadar API")
     repository = InMemoryCareerSourceAdapter()
     telemetry = lifecycle_telemetry or StructuredLifecycleTelemetryAdapter()
     scoring_metrics = scoring_telemetry or StructuredScoringTelemetryAdapter()
     gating_metrics = gating_telemetry or StructuredGatingTelemetryAdapter()
+    precision_metrics = precision_telemetry or StructuredPrecisionTelemetryAdapter()
     postings = job_posting_repository or InMemoryJobPostingAdapter(telemetry=telemetry)
     profiles = user_profile_repository or InMemoryUserProfileAdapter()
     match_scores = match_score_repository or InMemoryMatchScoreAdapter()
     gate_configs = gate_config_repository or InMemoryRecommendationGateConfigAdapter()
     gated_recommendations = gated_recommendation_repository or InMemoryGatedRecommendationAdapter()
+    precision_configs = precision_config_repository or InMemoryPrecisionPolicyConfigAdapter()
+    top_recommendations = top_recommendation_repository or InMemoryTopRecommendationAdapter()
     service = CareerSourceService(
         repository=repository,
         config=SourcePolicyConfig(max_enabled_sources=max_enabled_sources),
@@ -552,6 +662,13 @@ def create_app(
         gate_config_repository=gate_configs,
         gated_recommendation_repository=gated_recommendations,
         telemetry=gating_metrics,
+    )
+    precision_config_service = PrecisionPolicyConfigService(repository=precision_configs)
+    precision_service = ApplyPrecisionPolicyUseCase(
+        gated_recommendation_repository=gated_recommendations,
+        precision_config_repository=precision_configs,
+        top_recommendation_repository=top_recommendations,
+        telemetry=precision_metrics,
     )
 
     @app.post("/career-sources")
@@ -727,6 +844,41 @@ def create_app(
     @app.get("/observability/gating-metrics")
     def gating_metrics_endpoint():
         return envelope(data=gating_metrics.snapshot_metrics())
+
+    @app.get("/recommendation-precision-config")
+    def get_recommendation_precision_config():
+        return envelope(data=_precision_config_to_dict(precision_config_service.get()))
+
+    @app.put("/recommendation-precision-config")
+    def save_recommendation_precision_config(payload: PrecisionPolicyConfigRequest):
+        try:
+            config = precision_config_service.save(
+                min_confidence_for_top=payload.min_confidence_for_top,
+                max_top_count=payload.max_top_count,
+                config_version=payload.config_version,
+            )
+        except PrecisionValidationError as exc:
+            return precision_error_response(exc)
+        return envelope(data=_precision_config_to_dict(config))
+
+    @app.post("/recommendations/precision/run")
+    def run_precision_policy(x_correlation_id: str = Header(default="local")):
+        result = precision_service.run_precision_policy(correlation_id=x_correlation_id)
+        return _precision_result_response(result, correlation_id=x_correlation_id)
+
+    @app.get("/recommendations/top")
+    def list_top_recommendations():
+        items = [_top_recommendation_to_dict(item) for item in top_recommendations.list_top()]
+        return envelope(data=items)
+
+    @app.get("/recommendations/precision-traces")
+    def list_precision_traces():
+        items = [_top_recommendation_to_dict(item) for item in top_recommendations.list_all()]
+        return envelope(data=items)
+
+    @app.get("/observability/precision-metrics")
+    def precision_metrics_endpoint():
+        return envelope(data=precision_metrics.snapshot_metrics())
 
     return app
 
