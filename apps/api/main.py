@@ -12,6 +12,11 @@ from src.adapters.crawling.plugins.generic_stub_plugin import GenericStubCrawler
 from src.adapters.observability.structured_lifecycle_telemetry_adapter import (
     StructuredLifecycleTelemetryAdapter,
 )
+from src.adapters.observability.structured_scoring_telemetry_adapter import (
+    StructuredScoringTelemetryAdapter,
+)
+from src.adapters.persistence.in_memory_match_score_adapter import InMemoryMatchScoreAdapter
+from src.adapters.persistence.in_memory_user_profile_adapter import InMemoryUserProfileAdapter
 from src.adapters.persistence.in_memory_career_source_adapter import InMemoryCareerSourceAdapter
 from src.adapters.persistence.in_memory_job_posting_adapter import InMemoryJobPostingAdapter
 from src.application.ingestion.enrich_crawl_outcome import CrawlNormalizationService
@@ -19,9 +24,12 @@ from src.application.ingestion.normalize_records import NormalizeCrawlRecordsUse
 from src.application.ingestion.track_lifecycle import JobLifecycleService
 from src.application.use_cases.career_source import CareerSourceService
 from src.application.use_cases.discover_jobs import DiscoverJobsUseCase
+from src.application.use_cases.score_job_postings import ScoreJobPostingsUseCase
+from src.application.use_cases.user_profile import UserProfileService
 from src.application.use_cases.source_compliance import SourceComplianceService
 from src.domain.crawl import CrawlRunResult, SourceCrawlOutcome, SourceCrawlStatus
 from src.domain.job_posting import JobPosting
+from src.domain.match_scoring import ScoringBatchResult, ScoringFailure
 from src.domain.normalization import NormalizationRejection
 from src.domain.source_policy import SourcePolicyConfig, SourceValidationError
 from src.ports.compliance_check_port import ComplianceCheckPort
@@ -35,6 +43,10 @@ ERROR_STATUS_BY_CODE: dict[str, int] = {
     "SOURCE_COMPLIANCE_NOT_APPROVED": 409,
     "SOURCE_COMPLIANCE_CHECK_FAILED": 409,
     "SOURCE_ENABLED_LIMIT_EXCEEDED": 409,
+    "PROFILE_NOT_CONFIGURED": 409,
+    "PROFILE_SKILLS_REQUIRED": 400,
+    "PROFILE_LOCATIONS_REQUIRED": 400,
+    "PROFILE_SENIORITY_REQUIRED": 400,
 }
 
 
@@ -130,6 +142,43 @@ class NormalizationRejectionResponse(BaseModel):
     missing_fields: list[str]
 
 
+class UserProfileRequest(BaseModel):
+    skills: list[str]
+    preferred_locations: list[str]
+    preferred_languages: list[str] = Field(default_factory=list)
+    target_seniority: str
+
+
+class UserProfileResponse(BaseModel):
+    id: str
+    skills: list[str]
+    preferred_locations: list[str]
+    preferred_languages: list[str]
+    target_seniority: str
+    profile_version: str
+    updated_at: str
+
+
+class MatchScoreResponse(BaseModel):
+    job_posting_id: str
+    score: int
+    profile_version: str
+    config_version: str
+    signal_breakdown: dict[str, int]
+    computed_at: str
+
+
+class ScoringBatchResponse(BaseModel):
+    scored_count: int
+    skipped_count: int
+    scores: list[MatchScoreResponse]
+
+
+class ScoringFailureResponse(BaseModel):
+    code: str
+    message: str
+
+
 def envelope(*, data=None, error=None, meta=None):
     return {"data": data, "error": error, "meta": meta or {}}
 
@@ -193,6 +242,49 @@ def _lifecycle_transition_to_dict(transition) -> dict:
         correlation_id=transition.correlation_id,
         transitioned_at=transition.transitioned_at.isoformat(),
     ).model_dump()
+
+
+def _profile_to_dict(profile) -> dict:
+    return UserProfileResponse(
+        id=profile.id,
+        skills=list(profile.skills),
+        preferred_locations=list(profile.preferred_locations),
+        preferred_languages=list(profile.preferred_languages),
+        target_seniority=profile.target_seniority,
+        profile_version=profile.profile_version,
+        updated_at=profile.updated_at.isoformat(),
+    ).model_dump()
+
+
+def _match_score_to_dict(score) -> dict:
+    return MatchScoreResponse(
+        job_posting_id=score.job_posting_id,
+        score=score.score,
+        profile_version=score.profile_version,
+        config_version=score.config_version,
+        signal_breakdown=dict(score.signal_breakdown),
+        computed_at=score.computed_at.isoformat(),
+    ).model_dump()
+
+
+def _scoring_result_response(result: ScoringBatchResult | ScoringFailure, *, correlation_id: str):
+    if isinstance(result, ScoringFailure):
+        status_code = ERROR_STATUS_BY_CODE.get(result.code, 400)
+        return JSONResponse(
+            status_code=status_code,
+            content=envelope(
+                error={"code": result.code, "message": result.message},
+                meta={"correlation_id": correlation_id},
+            ),
+        )
+    return envelope(
+        data=ScoringBatchResponse(
+            scored_count=result.scored_count,
+            skipped_count=result.skipped_count,
+            scores=[_match_score_to_dict(score) for score in result.scores],
+        ).model_dump(),
+        meta={"correlation_id": correlation_id},
+    )
 
 
 def _duplicate_link_to_dict(link) -> dict:
@@ -273,11 +365,17 @@ def create_app(
     extra_plugins: list[CrawlerPluginPort] | None = None,
     job_posting_repository: InMemoryJobPostingAdapter | None = None,
     lifecycle_telemetry: StructuredLifecycleTelemetryAdapter | None = None,
+    user_profile_repository: InMemoryUserProfileAdapter | None = None,
+    match_score_repository: InMemoryMatchScoreAdapter | None = None,
+    scoring_telemetry: StructuredScoringTelemetryAdapter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JobRadar API")
     repository = InMemoryCareerSourceAdapter()
     telemetry = lifecycle_telemetry or StructuredLifecycleTelemetryAdapter()
+    scoring_metrics = scoring_telemetry or StructuredScoringTelemetryAdapter()
     postings = job_posting_repository or InMemoryJobPostingAdapter(telemetry=telemetry)
+    profiles = user_profile_repository or InMemoryUserProfileAdapter()
+    match_scores = match_score_repository or InMemoryMatchScoreAdapter()
     service = CareerSourceService(
         repository=repository,
         config=SourcePolicyConfig(max_enabled_sources=max_enabled_sources),
@@ -300,6 +398,13 @@ def create_app(
         plugin_registry=plugin_registry,
         normalization_service=normalization_service,
         lifecycle_service=lifecycle_service,
+    )
+    profile_service = UserProfileService(repository=profiles)
+    scoring_service = ScoreJobPostingsUseCase(
+        profile_repository=profiles,
+        job_posting_repository=postings,
+        match_score_repository=match_scores,
+        telemetry=scoring_metrics,
     )
 
     @app.post("/career-sources")
@@ -397,6 +502,40 @@ def create_app(
     @app.get("/observability/lifecycle-metrics")
     def lifecycle_metrics():
         return envelope(data=telemetry.snapshot_metrics())
+
+    @app.get("/user-profile")
+    def get_user_profile():
+        profile = profile_service.get()
+        if profile is None:
+            return JSONResponse(
+                status_code=404,
+                content=envelope(error={"code": "PROFILE_NOT_CONFIGURED", "message": "User profile is not configured."}),
+            )
+        return envelope(data=_profile_to_dict(profile))
+
+    @app.put("/user-profile")
+    def save_user_profile(payload: UserProfileRequest):
+        profile = profile_service.save(
+            skills=payload.skills,
+            preferred_locations=payload.preferred_locations,
+            preferred_languages=payload.preferred_languages,
+            target_seniority=payload.target_seniority,
+        )
+        return envelope(data=_profile_to_dict(profile))
+
+    @app.post("/match-scores/run")
+    def run_match_scoring(x_correlation_id: str = Header(default="local")):
+        result = scoring_service.score_all_eligible(correlation_id=x_correlation_id)
+        return _scoring_result_response(result, correlation_id=x_correlation_id)
+
+    @app.get("/match-scores")
+    def list_match_scores():
+        items = [_match_score_to_dict(score) for score in match_scores.list_scores()]
+        return envelope(data=items)
+
+    @app.get("/observability/scoring-metrics")
+    def scoring_metrics_endpoint():
+        return envelope(data=scoring_metrics.snapshot_metrics())
 
     return app
 
