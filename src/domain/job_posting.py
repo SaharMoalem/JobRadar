@@ -5,6 +5,9 @@ from datetime import datetime, timezone
 from enum import Enum
 
 
+from src.domain.lifecycle import JobLifecycleState
+
+
 class JobPostingCompleteness(str, Enum):
     COMPLETE = "complete"
     INCOMPLETE = "incomplete"
@@ -26,6 +29,10 @@ class JobPosting:
     external_id: str
     plugin_id: str
     identity_key: str | None = None
+    lifecycle_state: JobLifecycleState = JobLifecycleState.NEW
+    last_seen_at: datetime | None = None
+    expired_at: datetime | None = None
+    archived_at: datetime | None = None
     completeness: JobPostingCompleteness = JobPostingCompleteness.COMPLETE
     rejection_reason: str | None = None
     source_metadata: dict[str, object] = field(default_factory=dict)

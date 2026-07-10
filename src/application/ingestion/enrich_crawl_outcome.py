@@ -14,8 +14,10 @@ class CrawlNormalizationService:
     normalizer_registry: InMemoryCrawlNormalizerRegistry
     normalize_use_case: NormalizeCrawlRecordsUseCase
 
-    def enrich_outcome(self, outcome: SourceCrawlOutcome) -> SourceCrawlOutcome:
-        if outcome.status != SourceCrawlStatus.SUCCEEDED or not outcome.records:
+    def enrich_outcome(self, outcome: SourceCrawlOutcome, *, correlation_id: str) -> SourceCrawlOutcome:
+        if outcome.status != SourceCrawlStatus.SUCCEEDED:
+            return outcome
+        if not outcome.records:
             return outcome
 
         source = self.repository.get(outcome.source_id)
@@ -29,6 +31,7 @@ class CrawlNormalizationService:
                 list(outcome.records),
                 source=source,
                 reason="CRAWLER_NORMALIZER_NOT_FOUND",
+                correlation_id=correlation_id,
             )
             return replace(
                 outcome,
@@ -40,6 +43,7 @@ class CrawlNormalizationService:
             list(outcome.records),
             source=source,
             normalizer=normalizer,
+            correlation_id=correlation_id,
         )
         return replace(
             outcome,

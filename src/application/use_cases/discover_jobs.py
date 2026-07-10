@@ -7,6 +7,7 @@ from src.adapters.crawling.plugin_runtime import CrawlerPluginRuntime
 from src.application.discovery.execution_gate import gate_source_execution
 from src.application.discovery.filter_sources import filter_runnable_sources
 from src.application.ingestion.enrich_crawl_outcome import CrawlNormalizationService
+from src.application.ingestion.track_lifecycle import JobLifecycleService
 from src.domain.career_source import CareerSource
 from src.domain.crawl import CrawlRunResult, SourceCrawlOutcome, SourceCrawlStatus
 from src.domain.source_policy import SourceValidationError
@@ -20,15 +21,19 @@ class DiscoverJobsUseCase:
     plugin_registry: CrawlerPluginRegistryPort
     runtime: CrawlerPluginRuntime = field(default_factory=CrawlerPluginRuntime)
     normalization_service: CrawlNormalizationService | None = None
+    lifecycle_service: JobLifecycleService | None = None
 
     def run_all(self, *, correlation_id: str) -> CrawlRunResult:
         runnable = filter_runnable_sources(self.repository.list_all(), correlation_id)
         outcomes = [
             self._finalize_outcome(
-                self._execute_source(source, correlation_id=correlation_id, enforce_gate=True)
+                self._execute_source(source, correlation_id=correlation_id, enforce_gate=True),
+                correlation_id=correlation_id,
             )
             for source in runnable
         ]
+        if self.lifecycle_service is not None:
+            self.lifecycle_service.apply_retention(correlation_id=correlation_id)
         return CrawlRunResult(
             correlation_id=correlation_id,
             outcomes=outcomes,
@@ -40,9 +45,13 @@ class DiscoverJobsUseCase:
         if source is None:
             raise SourceValidationError("SOURCE_NOT_FOUND", "Career source not found.")
         gate_source_execution(source, correlation_id=correlation_id)
-        return self._finalize_outcome(
-            self._execute_source(source, correlation_id=correlation_id, enforce_gate=False)
+        outcome = self._finalize_outcome(
+            self._execute_source(source, correlation_id=correlation_id, enforce_gate=False),
+            correlation_id=correlation_id,
         )
+        if self.lifecycle_service is not None:
+            self.lifecycle_service.apply_retention(correlation_id=correlation_id)
+        return outcome
 
     def _execute_source(
         self,
@@ -76,7 +85,14 @@ class DiscoverJobsUseCase:
 
         return self.runtime.execute(plugin, source, correlation_id=correlation_id)
 
-    def _finalize_outcome(self, outcome: SourceCrawlOutcome) -> SourceCrawlOutcome:
-        if self.normalization_service is None:
-            return outcome
-        return self.normalization_service.enrich_outcome(outcome)
+    def _finalize_outcome(self, outcome: SourceCrawlOutcome, *, correlation_id: str) -> SourceCrawlOutcome:
+        if self.normalization_service is not None:
+            outcome = self.normalization_service.enrich_outcome(outcome, correlation_id=correlation_id)
+        if self.lifecycle_service is not None and outcome.status == SourceCrawlStatus.SUCCEEDED:
+            seen_posting_ids = {posting.id for posting in outcome.job_postings}
+            self.lifecycle_service.finalize_source_crawl(
+                outcome.source_id,
+                seen_posting_ids,
+                correlation_id=correlation_id,
+            )
+        return outcome

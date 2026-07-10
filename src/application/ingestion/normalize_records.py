@@ -21,6 +21,7 @@ class NormalizeCrawlRecordsUseCase:
         *,
         source: CareerSource,
         normalizer: CrawlNormalizerPort,
+        correlation_id: str,
     ) -> NormalizationBatchResult:
         accepted: list[JobPosting] = []
         rejected: list[NormalizationRejection] = []
@@ -49,6 +50,10 @@ class NormalizeCrawlRecordsUseCase:
             if not missing:
                 posting.completeness = JobPostingCompleteness.COMPLETE
                 posting.rejection_reason = None
+                posting.source_metadata = {
+                    **dict(posting.source_metadata),
+                    "correlation_id": correlation_id,
+                }
                 saved = self.job_posting_repository.save_posting(posting)
                 accepted.append(saved)
                 continue
@@ -70,6 +75,7 @@ class NormalizeCrawlRecordsUseCase:
         *,
         source: CareerSource,
         reason: str,
+        correlation_id: str = "unknown",
     ) -> NormalizationBatchResult:
         rejected: list[NormalizationRejection] = []
         for record in records:

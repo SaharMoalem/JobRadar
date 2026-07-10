@@ -9,10 +9,14 @@ from src.adapters.crawling.normalizer_registry import InMemoryCrawlNormalizerReg
 from src.adapters.crawling.normalizers.generic_stub_normalizer import GenericStubCrawlNormalizer
 from src.adapters.crawling.plugin_registry import InMemoryCrawlerPluginRegistry
 from src.adapters.crawling.plugins.generic_stub_plugin import GenericStubCrawlerPlugin
+from src.adapters.observability.structured_lifecycle_telemetry_adapter import (
+    StructuredLifecycleTelemetryAdapter,
+)
 from src.adapters.persistence.in_memory_career_source_adapter import InMemoryCareerSourceAdapter
 from src.adapters.persistence.in_memory_job_posting_adapter import InMemoryJobPostingAdapter
 from src.application.ingestion.enrich_crawl_outcome import CrawlNormalizationService
 from src.application.ingestion.normalize_records import NormalizeCrawlRecordsUseCase
+from src.application.ingestion.track_lifecycle import JobLifecycleService
 from src.application.use_cases.career_source import CareerSourceService
 from src.application.use_cases.discover_jobs import DiscoverJobsUseCase
 from src.application.use_cases.source_compliance import SourceComplianceService
@@ -94,7 +98,19 @@ class JobPostingResponse(BaseModel):
     external_id: str
     plugin_id: str
     identity_key: str | None = None
+    lifecycle_state: str
+    last_seen_at: str | None = None
+    expired_at: str | None = None
     completeness: str
+
+
+class JobLifecycleTransitionResponse(BaseModel):
+    job_posting_id: str
+    from_state: str | None
+    to_state: str
+    reason: str
+    correlation_id: str
+    transitioned_at: str
 
 
 class JobDuplicateLinkResponse(BaseModel):
@@ -161,7 +177,21 @@ def _job_posting_to_dict(posting: JobPosting) -> dict:
         external_id=posting.external_id,
         plugin_id=posting.plugin_id,
         identity_key=posting.identity_key,
+        lifecycle_state=posting.lifecycle_state.value,
+        last_seen_at=posting.last_seen_at.isoformat() if posting.last_seen_at else None,
+        expired_at=posting.expired_at.isoformat() if posting.expired_at else None,
         completeness=posting.completeness.value,
+    ).model_dump()
+
+
+def _lifecycle_transition_to_dict(transition) -> dict:
+    return JobLifecycleTransitionResponse(
+        job_posting_id=transition.job_posting_id,
+        from_state=transition.from_state.value if transition.from_state else None,
+        to_state=transition.to_state.value,
+        reason=transition.reason,
+        correlation_id=transition.correlation_id,
+        transitioned_at=transition.transitioned_at.isoformat(),
     ).model_dump()
 
 
@@ -242,10 +272,12 @@ def create_app(
     compliance_checker: ComplianceCheckPort | None = None,
     extra_plugins: list[CrawlerPluginPort] | None = None,
     job_posting_repository: InMemoryJobPostingAdapter | None = None,
+    lifecycle_telemetry: StructuredLifecycleTelemetryAdapter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JobRadar API")
     repository = InMemoryCareerSourceAdapter()
-    postings = job_posting_repository or InMemoryJobPostingAdapter()
+    telemetry = lifecycle_telemetry or StructuredLifecycleTelemetryAdapter()
+    postings = job_posting_repository or InMemoryJobPostingAdapter(telemetry=telemetry)
     service = CareerSourceService(
         repository=repository,
         config=SourcePolicyConfig(max_enabled_sources=max_enabled_sources),
@@ -262,10 +294,12 @@ def create_app(
         normalizer_registry=normalizer_registry,
         normalize_use_case=normalize_use_case,
     )
+    lifecycle_service = JobLifecycleService(repository=postings, telemetry=telemetry)
     discovery_service = DiscoverJobsUseCase(
         repository=repository,
         plugin_registry=plugin_registry,
         normalization_service=normalization_service,
+        lifecycle_service=lifecycle_service,
     )
 
     @app.post("/career-sources")
@@ -351,6 +385,18 @@ def create_app(
     def list_job_duplicate_links():
         items = [_duplicate_link_to_dict(link) for link in postings.list_duplicate_links()]
         return envelope(data=items)
+
+    @app.get("/job-lifecycle-transitions")
+    def list_job_lifecycle_transitions(job_posting_id: str | None = None):
+        items = [
+            _lifecycle_transition_to_dict(transition)
+            for transition in postings.list_lifecycle_transitions(job_posting_id)
+        ]
+        return envelope(data=items)
+
+    @app.get("/observability/lifecycle-metrics")
+    def lifecycle_metrics():
+        return envelope(data=telemetry.snapshot_metrics())
 
     return app
 

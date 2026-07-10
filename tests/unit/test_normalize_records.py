@@ -33,7 +33,7 @@ def test_enrich_outcome_rejects_when_normalizer_missing():
         ],
     )
 
-    enriched = service.enrich_outcome(outcome)
+    enriched = service.enrich_outcome(outcome, correlation_id="norm-missing-1")
 
     assert enriched.status == SourceCrawlStatus.SUCCEEDED
     assert enriched.job_postings == ()
@@ -71,7 +71,7 @@ def test_normalize_revalidates_even_when_normalizer_marks_complete():
         raw_payload={},
     )
 
-    batch = use_case.normalize([record], source=source, normalizer=LyingNormalizer())
+    batch = use_case.normalize([record], source=source, normalizer=LyingNormalizer(), correlation_id="corr-lying")
 
     assert batch.accepted == []
     assert len(batch.rejected) == 1
@@ -113,7 +113,7 @@ def test_normalize_isolates_per_record_failures():
         RawCrawlRecord(external_id="bad", title="Bad", url="https://example.com/bad", raw_payload={}),
     ]
 
-    batch = use_case.normalize(records, source=source, normalizer=FlakyNormalizer())
+    batch = use_case.normalize(records, source=source, normalizer=FlakyNormalizer(), correlation_id="corr-flaky")
 
     assert len(batch.accepted) == 1
     assert len(batch.rejected) == 1
