@@ -9,6 +9,13 @@ from src.adapters.crawling.normalizer_registry import InMemoryCrawlNormalizerReg
 from src.adapters.crawling.normalizers.generic_stub_normalizer import GenericStubCrawlNormalizer
 from src.adapters.crawling.plugin_registry import InMemoryCrawlerPluginRegistry
 from src.adapters.crawling.plugins.generic_stub_plugin import GenericStubCrawlerPlugin
+from src.adapters.explainability.rule_based_explainability_generator import (
+    InMemoryExplainableRecommendationAdapter,
+    RuleBasedExplainabilityGeneratorAdapter,
+)
+from src.adapters.observability.structured_explainability_telemetry_adapter import (
+    StructuredExplainabilityTelemetryAdapter,
+)
 from src.adapters.observability.structured_precision_telemetry_adapter import (
     StructuredPrecisionTelemetryAdapter,
 )
@@ -44,6 +51,7 @@ from src.application.use_cases.apply_actionable_gating import ApplyActionableGat
 from src.application.use_cases.apply_precision_policy import ApplyPrecisionPolicyUseCase
 from src.application.use_cases.career_source import CareerSourceService
 from src.application.use_cases.discover_jobs import DiscoverJobsUseCase
+from src.application.use_cases.generate_explainability import GenerateExplainabilityUseCase
 from src.application.use_cases.precision_policy_config import PrecisionPolicyConfigService
 from src.application.use_cases.recommendation_gate_config import RecommendationGateConfigService
 from src.application.use_cases.score_job_postings import ScoreJobPostingsUseCase
@@ -53,6 +61,7 @@ from src.domain.crawl import CrawlRunResult, SourceCrawlOutcome, SourceCrawlStat
 from src.domain.job_posting import JobPosting
 from src.domain.match_scoring import ScoringBatchResult, ScoringFailure
 from src.domain.normalization import NormalizationRejection
+from src.domain.explainability import ExplainabilityBatchResult, ExplainabilityFailure
 from src.domain.precision_policy import (
     PrecisionBatchResult,
     PrecisionFailure,
@@ -298,6 +307,33 @@ class PrecisionBatchResponse(BaseModel):
     top_recommendations: list[TopRecommendationResponse]
 
 
+class ExplainabilityNoteResponse(BaseModel):
+    match_rationale: str
+    missing_skills: list[str]
+    interview_probability_pct: int
+    effort_estimate: str
+
+
+class ExplainableRecommendationResponse(BaseModel):
+    job_posting_id: str
+    match_score: int
+    profile_version: str
+    scoring_config_version: str
+    gate_config_version: str
+    policy_version: str
+    promoted: bool
+    note: ExplainabilityNoteResponse | None
+    failure_code: str | None
+    failure_reason: str | None
+    generated_at: str
+
+
+class ExplainabilityBatchResponse(BaseModel):
+    promoted_count: int
+    failed_count: int
+    recommendations: list[ExplainableRecommendationResponse]
+
+
 def envelope(*, data=None, error=None, meta=None):
     return {"data": data, "error": error, "meta": meta or {}}
 
@@ -523,6 +559,59 @@ def precision_error_response(exc: PrecisionValidationError) -> JSONResponse:
     )
 
 
+def _explainability_note_to_dict(note) -> dict:
+    return ExplainabilityNoteResponse(
+        match_rationale=note.match_rationale,
+        missing_skills=list(note.missing_skills),
+        interview_probability_pct=note.interview_probability_pct,
+        effort_estimate=note.effort_estimate,
+    ).model_dump()
+
+
+def _explainable_recommendation_to_dict(recommendation) -> dict:
+    return ExplainableRecommendationResponse(
+        job_posting_id=recommendation.job_posting_id,
+        match_score=recommendation.match_score,
+        profile_version=recommendation.profile_version,
+        scoring_config_version=recommendation.scoring_config_version,
+        gate_config_version=recommendation.gate_config_version,
+        policy_version=recommendation.policy_version,
+        promoted=recommendation.promoted,
+        note=_explainability_note_to_dict(recommendation.note) if recommendation.note else None,
+        failure_code=recommendation.failure_code,
+        failure_reason=recommendation.failure_reason,
+        generated_at=recommendation.generated_at.isoformat(),
+    ).model_dump()
+
+
+def _explainability_result_response(
+    result: ExplainabilityBatchResult | ExplainabilityFailure,
+    *,
+    correlation_id: str,
+):
+    if isinstance(result, ExplainabilityFailure):
+        status_code = ERROR_STATUS_BY_CODE.get(result.code, 400)
+        return JSONResponse(
+            status_code=status_code,
+            content=envelope(
+                error={"code": result.code, "message": result.message},
+                meta={"correlation_id": correlation_id},
+            ),
+        )
+    return envelope(
+        data=ExplainabilityBatchResponse(
+            promoted_count=result.promoted_count,
+            failed_count=result.failed_count,
+            recommendations=[
+                _explainable_recommendation_to_dict(item)
+                for item in result.recommendations
+                if item.promoted
+            ],
+        ).model_dump(),
+        meta={"correlation_id": correlation_id},
+    )
+
+
 def _duplicate_link_to_dict(link) -> dict:
     return JobDuplicateLinkResponse(
         canonical_id=link.canonical_id,
@@ -610,6 +699,8 @@ def create_app(
     precision_config_repository: InMemoryPrecisionPolicyConfigAdapter | None = None,
     top_recommendation_repository: InMemoryTopRecommendationAdapter | None = None,
     precision_telemetry: StructuredPrecisionTelemetryAdapter | None = None,
+    explainable_recommendation_repository: InMemoryExplainableRecommendationAdapter | None = None,
+    explainability_telemetry: StructuredExplainabilityTelemetryAdapter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JobRadar API")
     repository = InMemoryCareerSourceAdapter()
@@ -617,6 +708,7 @@ def create_app(
     scoring_metrics = scoring_telemetry or StructuredScoringTelemetryAdapter()
     gating_metrics = gating_telemetry or StructuredGatingTelemetryAdapter()
     precision_metrics = precision_telemetry or StructuredPrecisionTelemetryAdapter()
+    explainability_metrics = explainability_telemetry or StructuredExplainabilityTelemetryAdapter()
     postings = job_posting_repository or InMemoryJobPostingAdapter(telemetry=telemetry)
     profiles = user_profile_repository or InMemoryUserProfileAdapter()
     match_scores = match_score_repository or InMemoryMatchScoreAdapter()
@@ -624,6 +716,9 @@ def create_app(
     gated_recommendations = gated_recommendation_repository or InMemoryGatedRecommendationAdapter()
     precision_configs = precision_config_repository or InMemoryPrecisionPolicyConfigAdapter()
     top_recommendations = top_recommendation_repository or InMemoryTopRecommendationAdapter()
+    explainable_recommendations = (
+        explainable_recommendation_repository or InMemoryExplainableRecommendationAdapter()
+    )
     service = CareerSourceService(
         repository=repository,
         config=SourcePolicyConfig(max_enabled_sources=max_enabled_sources),
@@ -669,6 +764,16 @@ def create_app(
         precision_config_repository=precision_configs,
         top_recommendation_repository=top_recommendations,
         telemetry=precision_metrics,
+    )
+    explainability_service = GenerateExplainabilityUseCase(
+        profile_repository=profiles,
+        job_posting_repository=postings,
+        match_score_repository=match_scores,
+        gated_recommendation_repository=gated_recommendations,
+        top_recommendation_repository=top_recommendations,
+        explainable_recommendation_repository=explainable_recommendations,
+        generator=RuleBasedExplainabilityGeneratorAdapter(),
+        telemetry=explainability_metrics,
     )
 
     @app.post("/career-sources")
@@ -879,6 +984,30 @@ def create_app(
     @app.get("/observability/precision-metrics")
     def precision_metrics_endpoint():
         return envelope(data=precision_metrics.snapshot_metrics())
+
+    @app.post("/recommendations/explainability/run")
+    def run_explainability(x_correlation_id: str = Header(default="local")):
+        result = explainability_service.run_explainability(correlation_id=x_correlation_id)
+        return _explainability_result_response(result, correlation_id=x_correlation_id)
+
+    @app.get("/recommendations/explainable")
+    def list_explainable_recommendations():
+        items = [
+            _explainable_recommendation_to_dict(item)
+            for item in explainable_recommendations.list_promoted()
+        ]
+        return envelope(data=items)
+
+    @app.get("/recommendations/explainability-traces")
+    def list_explainability_traces():
+        items = [
+            _explainable_recommendation_to_dict(item) for item in explainable_recommendations.list_all()
+        ]
+        return envelope(data=items)
+
+    @app.get("/observability/explainability-metrics")
+    def explainability_metrics_endpoint():
+        return envelope(data=explainability_metrics.snapshot_metrics())
 
     return app
 
