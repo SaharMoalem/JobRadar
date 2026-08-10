@@ -1,0 +1,19 @@
+from __future__ import annotations
+
+from typing import Protocol
+
+from src.domain.application_tracker import TrackedOpportunity, TrackerTransition
+
+
+class ApplicationTrackerRepositoryPort(Protocol):
+    def get(self, job_posting_id: str) -> TrackedOpportunity | None: ...
+
+    def save(self, tracked: TrackedOpportunity) -> TrackedOpportunity: ...
+
+    def list_all(self) -> list[TrackedOpportunity]: ...
+
+    def list_bookmarked(self) -> list[TrackedOpportunity]: ...
+
+    def append_transition(self, transition: TrackerTransition) -> TrackerTransition: ...
+
+    def list_transitions(self, job_posting_id: str) -> list[TrackerTransition]: ...

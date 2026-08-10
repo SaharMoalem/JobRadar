@@ -47,6 +47,9 @@ from src.adapters.persistence.in_memory_job_posting_adapter import InMemoryJobPo
 from src.adapters.persistence.in_memory_opportunity_filter_state_adapter import (
     InMemoryOpportunityFilterStateAdapter,
 )
+from src.adapters.persistence.in_memory_application_tracker_adapter import (
+    InMemoryApplicationTrackerAdapter,
+)
 from src.application.ingestion.enrich_crawl_outcome import CrawlNormalizationService
 from src.application.ingestion.normalize_records import NormalizeCrawlRecordsUseCase
 from src.application.ingestion.track_lifecycle import JobLifecycleService
@@ -59,12 +62,14 @@ from src.application.use_cases.precision_policy_config import PrecisionPolicyCon
 from src.application.use_cases.recommendation_gate_config import RecommendationGateConfigService
 from src.application.use_cases.score_job_postings import ScoreJobPostingsUseCase
 from src.application.use_cases.search_opportunities import SearchOpportunitiesUseCase
+from src.application.use_cases.application_tracker import ApplicationTrackerUseCase
 from src.application.use_cases.user_profile import UserProfileService
 from src.application.use_cases.source_compliance import SourceComplianceService
 from src.domain.crawl import CrawlRunResult, SourceCrawlOutcome, SourceCrawlStatus
 from src.domain.job_posting import JobPosting
 from src.domain.lifecycle import JobLifecycleState
 from src.domain.opportunity_search import OpportunitySearchCriteria, OpportunitySearchValidationError, WorkModel
+from src.domain.application_tracker import TrackerState, TrackerValidationError
 from src.domain.match_scoring import ScoringBatchResult, ScoringFailure
 from src.domain.normalization import NormalizationRejection
 from src.domain.explainability import ExplainabilityBatchResult, ExplainabilityFailure
@@ -100,6 +105,11 @@ ERROR_STATUS_BY_CODE: dict[str, int] = {
     "SEARCH_FRESHNESS_DAYS_INVALID": 400,
     "SEARCH_WORK_MODEL_INVALID": 400,
     "SEARCH_LIFECYCLE_STATE_INVALID": 400,
+    "TRACKER_JOB_POSTING_NOT_FOUND": 404,
+    "TRACKER_NOT_FOUND": 404,
+    "TRACKER_TRANSITION_INVALID": 409,
+    "TRACKER_TRANSITION_UNCHANGED": 409,
+    "TRACKER_STATE_INVALID": 400,
 }
 
 
@@ -379,6 +389,32 @@ class OpportunityFilterStateResponse(BaseModel):
     session_id: str
     criteria: dict[str, object]
     updated_at: str
+
+
+class BookmarkRequest(BaseModel):
+    job_posting_id: str
+
+
+class TrackerTransitionRequest(BaseModel):
+    to_state: str
+    reason: str = "manual_transition"
+
+
+class TrackedOpportunityResponse(BaseModel):
+    job_posting_id: str
+    tracker_state: str
+    bookmarked: bool
+    bookmarked_at: str | None
+    updated_at: str
+
+
+class TrackerTransitionResponse(BaseModel):
+    job_posting_id: str
+    from_state: str | None
+    to_state: str
+    reason: str
+    correlation_id: str
+    transitioned_at: str
 
 
 def envelope(*, data=None, error=None, meta=None):
@@ -799,6 +835,35 @@ def opportunity_search_error_response(exc: OpportunitySearchValidationError) -> 
     )
 
 
+def tracker_error_response(exc: TrackerValidationError) -> JSONResponse:
+    status_code = ERROR_STATUS_BY_CODE.get(exc.code, 400)
+    return JSONResponse(
+        status_code=status_code,
+        content=envelope(error={"code": exc.code, "message": str(exc)}),
+    )
+
+
+def _tracked_opportunity_to_dict(tracked) -> dict:
+    return TrackedOpportunityResponse(
+        job_posting_id=tracked.job_posting_id,
+        tracker_state=tracked.tracker_state.value,
+        bookmarked=tracked.bookmarked,
+        bookmarked_at=tracked.bookmarked_at.isoformat() if tracked.bookmarked_at else None,
+        updated_at=tracked.updated_at.isoformat(),
+    ).model_dump()
+
+
+def _tracker_transition_to_dict(transition) -> dict:
+    return TrackerTransitionResponse(
+        job_posting_id=transition.job_posting_id,
+        from_state=transition.from_state.value if transition.from_state else None,
+        to_state=transition.to_state.value,
+        reason=transition.reason,
+        correlation_id=transition.correlation_id,
+        transitioned_at=transition.transitioned_at.isoformat(),
+    ).model_dump()
+
+
 def _build_normalizer_registry(
     extra_plugins: list[CrawlerPluginPort] | None = None,
 ) -> InMemoryCrawlNormalizerRegistry:
@@ -835,6 +900,7 @@ def create_app(
     explainable_recommendation_repository: InMemoryExplainableRecommendationAdapter | None = None,
     explainability_telemetry: StructuredExplainabilityTelemetryAdapter | None = None,
     opportunity_filter_state_repository: InMemoryOpportunityFilterStateAdapter | None = None,
+    application_tracker_repository: InMemoryApplicationTrackerAdapter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JobRadar API")
     repository = InMemoryCareerSourceAdapter()
@@ -856,6 +922,7 @@ def create_app(
     opportunity_filter_states = (
         opportunity_filter_state_repository or InMemoryOpportunityFilterStateAdapter()
     )
+    application_trackers = application_tracker_repository or InMemoryApplicationTrackerAdapter()
     service = CareerSourceService(
         repository=repository,
         config=SourcePolicyConfig(max_enabled_sources=max_enabled_sources),
@@ -916,6 +983,10 @@ def create_app(
         job_posting_repository=postings,
         match_score_repository=match_scores,
         filter_state_repository=opportunity_filter_states,
+    )
+    tracker_service = ApplicationTrackerUseCase(
+        tracker_repository=application_trackers,
+        job_posting_repository=postings,
     )
 
     @app.post("/career-sources")
@@ -1188,6 +1259,87 @@ def create_app(
             data=_filter_state_to_dict(state),
             meta={"session_id": payload.session_id},
         )
+
+    @app.post("/tracker/bookmarks")
+    def bookmark_opportunity(payload: BookmarkRequest, x_correlation_id: str = Header(default="local")):
+        try:
+            tracked = tracker_service.bookmark(
+                payload.job_posting_id,
+                correlation_id=x_correlation_id,
+            )
+        except TrackerValidationError as exc:
+            return tracker_error_response(exc)
+        return envelope(data=_tracked_opportunity_to_dict(tracked), meta={"correlation_id": x_correlation_id})
+
+    @app.delete("/tracker/bookmarks/{job_posting_id}")
+    def unbookmark_opportunity(job_posting_id: str):
+        try:
+            tracked = tracker_service.unbookmark(job_posting_id)
+        except TrackerValidationError as exc:
+            return tracker_error_response(exc)
+        return envelope(data=_tracked_opportunity_to_dict(tracked))
+
+    @app.get("/tracker/bookmarks")
+    def list_bookmarked_opportunities():
+        items = [_tracked_opportunity_to_dict(item) for item in tracker_service.list_bookmarked()]
+        return envelope(data=items)
+
+    @app.get("/tracker")
+    def list_tracked_opportunities():
+        items = [_tracked_opportunity_to_dict(item) for item in tracker_service.list_tracked()]
+        return envelope(data=items)
+
+    @app.get("/tracker/{job_posting_id}")
+    def get_tracked_opportunity(job_posting_id: str):
+        tracked = tracker_service.get(job_posting_id)
+        if tracked is None:
+            return JSONResponse(
+                status_code=404,
+                content=envelope(
+                    error={
+                        "code": "TRACKER_NOT_FOUND",
+                        "message": f"No tracked opportunity found for job posting '{job_posting_id}'.",
+                    }
+                ),
+            )
+        return envelope(data=_tracked_opportunity_to_dict(tracked))
+
+    @app.post("/tracker/{job_posting_id}/transitions")
+    def transition_tracked_opportunity(
+        job_posting_id: str,
+        payload: TrackerTransitionRequest,
+        x_correlation_id: str = Header(default="local"),
+    ):
+        try:
+            to_state = TrackerState(payload.to_state.strip().lower())
+        except ValueError:
+            return tracker_error_response(
+                TrackerValidationError(
+                    "TRACKER_STATE_INVALID",
+                    f"Unsupported tracker state: {payload.to_state}",
+                )
+            )
+        try:
+            tracked = tracker_service.transition(
+                job_posting_id,
+                to_state=to_state,
+                reason=payload.reason,
+                correlation_id=x_correlation_id,
+            )
+        except TrackerValidationError as exc:
+            return tracker_error_response(exc)
+        return envelope(
+            data=_tracked_opportunity_to_dict(tracked),
+            meta={"correlation_id": x_correlation_id},
+        )
+
+    @app.get("/tracker/{job_posting_id}/transitions")
+    def list_tracker_transitions(job_posting_id: str):
+        items = [
+            _tracker_transition_to_dict(transition)
+            for transition in tracker_service.list_history(job_posting_id)
+        ]
+        return envelope(data=items)
 
     return app
 
