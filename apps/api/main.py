@@ -44,6 +44,9 @@ from src.adapters.persistence.in_memory_top_recommendation_adapter import (
 from src.adapters.persistence.in_memory_user_profile_adapter import InMemoryUserProfileAdapter
 from src.adapters.persistence.in_memory_career_source_adapter import InMemoryCareerSourceAdapter
 from src.adapters.persistence.in_memory_job_posting_adapter import InMemoryJobPostingAdapter
+from src.adapters.persistence.in_memory_opportunity_filter_state_adapter import (
+    InMemoryOpportunityFilterStateAdapter,
+)
 from src.application.ingestion.enrich_crawl_outcome import CrawlNormalizationService
 from src.application.ingestion.normalize_records import NormalizeCrawlRecordsUseCase
 from src.application.ingestion.track_lifecycle import JobLifecycleService
@@ -55,10 +58,13 @@ from src.application.use_cases.generate_explainability import GenerateExplainabi
 from src.application.use_cases.precision_policy_config import PrecisionPolicyConfigService
 from src.application.use_cases.recommendation_gate_config import RecommendationGateConfigService
 from src.application.use_cases.score_job_postings import ScoreJobPostingsUseCase
+from src.application.use_cases.search_opportunities import SearchOpportunitiesUseCase
 from src.application.use_cases.user_profile import UserProfileService
 from src.application.use_cases.source_compliance import SourceComplianceService
 from src.domain.crawl import CrawlRunResult, SourceCrawlOutcome, SourceCrawlStatus
 from src.domain.job_posting import JobPosting
+from src.domain.lifecycle import JobLifecycleState
+from src.domain.opportunity_search import OpportunitySearchCriteria, OpportunitySearchValidationError, WorkModel
 from src.domain.match_scoring import ScoringBatchResult, ScoringFailure
 from src.domain.normalization import NormalizationRejection
 from src.domain.explainability import ExplainabilityBatchResult, ExplainabilityFailure
@@ -89,6 +95,11 @@ ERROR_STATUS_BY_CODE: dict[str, int] = {
     "GATE_RECENCY_WINDOW_INVALID": 400,
     "PRECISION_MIN_CONFIDENCE_OUT_OF_RANGE": 400,
     "PRECISION_MAX_TOP_OUT_OF_RANGE": 400,
+    "SEARCH_SCORE_OUT_OF_RANGE": 400,
+    "SEARCH_SCORE_RANGE_INVALID": 400,
+    "SEARCH_FRESHNESS_DAYS_INVALID": 400,
+    "SEARCH_WORK_MODEL_INVALID": 400,
+    "SEARCH_LIFECYCLE_STATE_INVALID": 400,
 }
 
 
@@ -332,6 +343,42 @@ class ExplainabilityBatchResponse(BaseModel):
     promoted_count: int
     failed_count: int
     recommendations: list[ExplainableRecommendationResponse]
+
+
+class OpportunitySearchRequest(BaseModel):
+    role_family: str | None = None
+    location: str | None = None
+    work_model: str | None = None
+    min_score: int | None = None
+    max_score: int | None = None
+    freshness_days: int | None = None
+    lifecycle_states: list[str] | None = None
+    session_id: str = "default"
+
+
+class OpportunityItemResponse(BaseModel):
+    job_posting_id: str
+    title: str
+    company: str
+    location: str
+    url: str
+    posted_at: str | None
+    lifecycle_state: str
+    role_family: str
+    work_model: str
+    match_score: int | None
+
+
+class OpportunitySearchResponse(BaseModel):
+    items: list[OpportunityItemResponse]
+    total_count: int
+    empty: bool
+
+
+class OpportunityFilterStateResponse(BaseModel):
+    session_id: str
+    criteria: dict[str, object]
+    updated_at: str
 
 
 def envelope(*, data=None, error=None, meta=None):
@@ -666,6 +713,92 @@ def _run_to_dict(run: CrawlRunResult) -> dict:
     ).model_dump()
 
 
+def _criteria_to_dict(criteria: OpportunitySearchCriteria) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    if criteria.role_family is not None:
+        payload["role_family"] = criteria.role_family
+    if criteria.location is not None:
+        payload["location"] = criteria.location
+    if criteria.work_model is not None:
+        payload["work_model"] = criteria.work_model.value
+    if criteria.min_score is not None:
+        payload["min_score"] = criteria.min_score
+    if criteria.max_score is not None:
+        payload["max_score"] = criteria.max_score
+    if criteria.freshness_days is not None:
+        payload["freshness_days"] = criteria.freshness_days
+    if criteria.lifecycle_states is not None:
+        payload["lifecycle_states"] = [state.value for state in criteria.lifecycle_states]
+    return payload
+
+
+def _criteria_from_request(payload: OpportunitySearchRequest) -> OpportunitySearchCriteria:
+    work_model: WorkModel | None = None
+    if payload.work_model is not None:
+        normalized = payload.work_model.strip().lower().replace("-", "_")
+        try:
+            work_model = WorkModel(normalized)
+        except ValueError as exc:
+            raise OpportunitySearchValidationError(
+                "SEARCH_WORK_MODEL_INVALID",
+                f"Unsupported work model: {payload.work_model}",
+            ) from exc
+
+    lifecycle_states: tuple[JobLifecycleState, ...] | None = None
+    if payload.lifecycle_states is not None:
+        parsed_states: list[JobLifecycleState] = []
+        for state_value in payload.lifecycle_states:
+            try:
+                parsed_states.append(JobLifecycleState(state_value))
+            except ValueError as exc:
+                raise OpportunitySearchValidationError(
+                    "SEARCH_LIFECYCLE_STATE_INVALID",
+                    f"Unsupported lifecycle state: {state_value}",
+                ) from exc
+        lifecycle_states = tuple(parsed_states)
+
+    return OpportunitySearchCriteria(
+        role_family=payload.role_family,
+        location=payload.location,
+        work_model=work_model,
+        min_score=payload.min_score,
+        max_score=payload.max_score,
+        freshness_days=payload.freshness_days,
+        lifecycle_states=lifecycle_states,
+    )
+
+
+def _opportunity_item_to_dict(item) -> dict:
+    return OpportunityItemResponse(
+        job_posting_id=item.job_posting_id,
+        title=item.title,
+        company=item.company,
+        location=item.location,
+        url=item.url,
+        posted_at=item.posted_at.isoformat() if item.posted_at else None,
+        lifecycle_state=item.lifecycle_state.value,
+        role_family=item.role_family,
+        work_model=item.work_model.value,
+        match_score=item.match_score,
+    ).model_dump()
+
+
+def _filter_state_to_dict(state) -> dict:
+    return OpportunityFilterStateResponse(
+        session_id=state.session_id,
+        criteria=_criteria_to_dict(state.criteria),
+        updated_at=state.updated_at.isoformat(),
+    ).model_dump()
+
+
+def opportunity_search_error_response(exc: OpportunitySearchValidationError) -> JSONResponse:
+    status_code = ERROR_STATUS_BY_CODE.get(exc.code, 400)
+    return JSONResponse(
+        status_code=status_code,
+        content=envelope(error={"code": exc.code, "message": str(exc)}),
+    )
+
+
 def _build_normalizer_registry(
     extra_plugins: list[CrawlerPluginPort] | None = None,
 ) -> InMemoryCrawlNormalizerRegistry:
@@ -701,6 +834,7 @@ def create_app(
     precision_telemetry: StructuredPrecisionTelemetryAdapter | None = None,
     explainable_recommendation_repository: InMemoryExplainableRecommendationAdapter | None = None,
     explainability_telemetry: StructuredExplainabilityTelemetryAdapter | None = None,
+    opportunity_filter_state_repository: InMemoryOpportunityFilterStateAdapter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JobRadar API")
     repository = InMemoryCareerSourceAdapter()
@@ -718,6 +852,9 @@ def create_app(
     top_recommendations = top_recommendation_repository or InMemoryTopRecommendationAdapter()
     explainable_recommendations = (
         explainable_recommendation_repository or InMemoryExplainableRecommendationAdapter()
+    )
+    opportunity_filter_states = (
+        opportunity_filter_state_repository or InMemoryOpportunityFilterStateAdapter()
     )
     service = CareerSourceService(
         repository=repository,
@@ -774,6 +911,11 @@ def create_app(
         explainable_recommendation_repository=explainable_recommendations,
         generator=RuleBasedExplainabilityGeneratorAdapter(),
         telemetry=explainability_metrics,
+    )
+    opportunity_search_service = SearchOpportunitiesUseCase(
+        job_posting_repository=postings,
+        match_score_repository=match_scores,
+        filter_state_repository=opportunity_filter_states,
     )
 
     @app.post("/career-sources")
@@ -1008,6 +1150,44 @@ def create_app(
     @app.get("/observability/explainability-metrics")
     def explainability_metrics_endpoint():
         return envelope(data=explainability_metrics.snapshot_metrics())
+
+    @app.post("/opportunities/search")
+    def search_opportunities(payload: OpportunitySearchRequest):
+        try:
+            criteria = _criteria_from_request(payload)
+            result = opportunity_search_service.search(criteria, session_id=payload.session_id)
+        except OpportunitySearchValidationError as exc:
+            return opportunity_search_error_response(exc)
+        return envelope(
+            data=OpportunitySearchResponse(
+                items=[_opportunity_item_to_dict(item) for item in result.items],
+                total_count=result.total_count,
+                empty=result.is_empty,
+            ).model_dump(),
+            meta={
+                "session_id": payload.session_id,
+                "applied_filter": _criteria_to_dict(result.criteria),
+            },
+        )
+
+    @app.get("/opportunity-filter-state")
+    def get_opportunity_filter_state(session_id: str = "default"):
+        state = opportunity_search_service.get_filter_state(session_id)
+        if state is None:
+            return envelope(data=None, meta={"session_id": session_id})
+        return envelope(data=_filter_state_to_dict(state), meta={"session_id": session_id})
+
+    @app.put("/opportunity-filter-state")
+    def save_opportunity_filter_state(payload: OpportunitySearchRequest):
+        try:
+            criteria = _criteria_from_request(payload)
+            state = opportunity_search_service.save_filter_state(criteria, session_id=payload.session_id)
+        except OpportunitySearchValidationError as exc:
+            return opportunity_search_error_response(exc)
+        return envelope(
+            data=_filter_state_to_dict(state),
+            meta={"session_id": payload.session_id},
+        )
 
     return app
 

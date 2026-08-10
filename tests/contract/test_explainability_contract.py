@@ -44,6 +44,7 @@ async def test_explainable_recommendation_response_contract(client):
             "enforce_seniority": False,
             "enforce_skill_overlap": False,
             "enforce_language": False,
+            "enforce_recency": False,
             "global_threshold": 60,
         },
     )

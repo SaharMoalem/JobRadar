@@ -43,6 +43,11 @@ class GenericStubCrawlNormalizer:
                 "career_source_name": source.name,
                 "plugin_id": source.plugin_id,
                 "raw_external_id": record.external_id,
+                **{
+                    key: value
+                    for key in ("role_family", "work_model")
+                    if (value := raw.get(key)) is not None
+                },
             },
         )
         return apply_completeness(posting)
