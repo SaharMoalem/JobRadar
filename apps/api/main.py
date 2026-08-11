@@ -56,6 +56,13 @@ from src.adapters.persistence.in_memory_outbound_adapter import (
     InMemoryOutboundDeliveryAdapter,
     RecordingOutboundDeliveryAdapter,
 )
+from src.adapters.persistence.in_memory_immediate_alert_adapter import (
+    InMemoryImmediateAlertAdapter,
+    InMemoryImmediateAlertConfigAdapter,
+)
+from src.adapters.observability.structured_immediate_alert_telemetry_adapter import (
+    StructuredImmediateAlertTelemetryAdapter,
+)
 from src.adapters.drafts.rule_based_draft_artifact_generator import (
     RuleBasedDraftArtifactGeneratorAdapter,
 )
@@ -80,6 +87,8 @@ from src.application.use_cases.search_opportunities import SearchOpportunitiesUs
 from src.application.use_cases.application_tracker import ApplicationTrackerUseCase
 from src.application.use_cases.generate_draft_artifact import GenerateDraftArtifactUseCase
 from src.application.use_cases.outbound_approval import ApproveOutboundUseCase, DeliverOutboundUseCase
+from src.application.use_cases.immediate_alert_config import ImmediateAlertConfigService
+from src.application.use_cases.trigger_immediate_alerts import TriggerImmediateAlertsUseCase
 from src.application.use_cases.user_profile import UserProfileService
 from src.application.use_cases.source_compliance import SourceComplianceService
 from src.domain.crawl import CrawlRunResult, SourceCrawlOutcome, SourceCrawlStatus
@@ -89,6 +98,11 @@ from src.domain.opportunity_search import OpportunitySearchCriteria, Opportunity
 from src.domain.application_tracker import TrackerState, TrackerValidationError
 from src.domain.draft_artifact import DraftArtifactKind, DraftArtifactValidationError, DraftGenerationFailure
 from src.domain.outbound_approval import OutboundValidationError
+from src.domain.immediate_alert import (
+    ImmediateAlertBatchResult,
+    ImmediateAlertFailure,
+    ImmediateAlertValidationError,
+)
 from src.domain.match_scoring import ScoringBatchResult, ScoringFailure
 from src.ports.draft_artifact_port import DraftArtifactGeneratorPort
 from src.ports.outbound_approval_port import OutboundDeliveryPort
@@ -140,6 +154,9 @@ ERROR_STATUS_BY_CODE: dict[str, int] = {
     "OUTBOUND_ARTIFACT_NOT_DRAFT": 409,
     "OUTBOUND_APPROVAL_REQUIRED": 409,
     "OUTBOUND_APPROVAL_MISMATCH": 409,
+    "ALERT_THRESHOLD_OUT_OF_RANGE": 400,
+    "ALERT_CORRELATION_ID_REQUIRED": 400,
+    "ALERT_RUN_CONTEXT_INVALID": 400,
 }
 
 
@@ -484,6 +501,40 @@ class OutboundDeliveryResponse(BaseModel):
     correlation_id: str
     content_snapshot: str
     delivered_at: str
+
+
+class ImmediateAlertConfigRequest(BaseModel):
+    alert_threshold: int = Field(default=90, ge=0, le=100, strict=True)
+    config_version: str = "v1"
+
+
+class ImmediateAlertConfigResponse(BaseModel):
+    config_version: str
+    alert_threshold: int
+
+
+class ImmediateAlertRunRequest(BaseModel):
+    run_context: str | None = None
+
+
+class ImmediateAlertResponse(BaseModel):
+    id: str
+    job_posting_id: str
+    role_summary: str
+    match_score: int
+    deep_link: str
+    run_context: str
+    correlation_id: str
+    created_at: str
+
+
+class ImmediateAlertBatchResponse(BaseModel):
+    triggered_count: int
+    skipped_below_threshold_count: int
+    skipped_duplicate_count: int
+    skipped_missing_posting_count: int
+    run_context: str
+    alerts: list[ImmediateAlertResponse]
 
 
 def envelope(*, data=None, error=None, meta=None):
@@ -984,6 +1035,61 @@ def _outbound_delivery_to_dict(delivery) -> dict:
     ).model_dump()
 
 
+def _immediate_alert_config_to_dict(config) -> dict:
+    return ImmediateAlertConfigResponse(
+        config_version=config.config_version,
+        alert_threshold=config.alert_threshold,
+    ).model_dump()
+
+
+def _immediate_alert_to_dict(alert) -> dict:
+    return ImmediateAlertResponse(
+        id=alert.id,
+        job_posting_id=alert.job_posting_id,
+        role_summary=alert.role_summary,
+        match_score=alert.match_score,
+        deep_link=alert.deep_link,
+        run_context=alert.run_context,
+        correlation_id=alert.correlation_id,
+        created_at=alert.created_at.isoformat(),
+    ).model_dump()
+
+
+def _immediate_alert_result_response(
+    result: ImmediateAlertBatchResult | ImmediateAlertFailure,
+    *,
+    correlation_id: str,
+):
+    if isinstance(result, ImmediateAlertFailure):
+        status_code = ERROR_STATUS_BY_CODE.get(result.code, 400)
+        return JSONResponse(
+            status_code=status_code,
+            content=envelope(
+                error={"code": result.code, "message": result.message},
+                meta={"correlation_id": correlation_id},
+            ),
+        )
+    return envelope(
+        data=ImmediateAlertBatchResponse(
+            triggered_count=result.triggered_count,
+            skipped_below_threshold_count=result.skipped_below_threshold_count,
+            skipped_duplicate_count=result.skipped_duplicate_count,
+            skipped_missing_posting_count=result.skipped_missing_posting_count,
+            run_context=result.run_context,
+            alerts=[_immediate_alert_to_dict(item) for item in result.alerts],
+        ).model_dump(),
+        meta={"correlation_id": correlation_id},
+    )
+
+
+def immediate_alert_error_response(exc: ImmediateAlertValidationError) -> JSONResponse:
+    status_code = ERROR_STATUS_BY_CODE.get(exc.code, 400)
+    return JSONResponse(
+        status_code=status_code,
+        content=envelope(error={"code": exc.code, "message": str(exc)}),
+    )
+
+
 def _build_normalizer_registry(
     extra_plugins: list[CrawlerPluginPort] | None = None,
 ) -> InMemoryCrawlNormalizerRegistry:
@@ -1028,6 +1134,9 @@ def create_app(
     outbound_delivery_repository: InMemoryOutboundDeliveryAdapter | None = None,
     outbound_delivery_port: OutboundDeliveryPort | None = None,
     outbound_telemetry: StructuredOutboundTelemetryAdapter | None = None,
+    immediate_alert_config_repository: InMemoryImmediateAlertConfigAdapter | None = None,
+    immediate_alert_repository: InMemoryImmediateAlertAdapter | None = None,
+    immediate_alert_telemetry: StructuredImmediateAlertTelemetryAdapter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JobRadar API")
     repository = InMemoryCareerSourceAdapter()
@@ -1056,6 +1165,9 @@ def create_app(
     outbound_deliveries = outbound_delivery_repository or InMemoryOutboundDeliveryAdapter()
     outbound_metrics = outbound_telemetry or StructuredOutboundTelemetryAdapter()
     outbound_delivery = outbound_delivery_port or RecordingOutboundDeliveryAdapter()
+    alert_configs = immediate_alert_config_repository or InMemoryImmediateAlertConfigAdapter()
+    immediate_alerts = immediate_alert_repository or InMemoryImmediateAlertAdapter()
+    alert_metrics = immediate_alert_telemetry or StructuredImmediateAlertTelemetryAdapter()
     service = CareerSourceService(
         repository=repository,
         config=SourcePolicyConfig(max_enabled_sources=max_enabled_sources),
@@ -1140,6 +1252,14 @@ def create_app(
         delivery_port=outbound_delivery,
         delivery_repository=outbound_deliveries,
         telemetry=outbound_metrics,
+    )
+    alert_config_service = ImmediateAlertConfigService(repository=alert_configs)
+    immediate_alert_service = TriggerImmediateAlertsUseCase(
+        gated_recommendation_repository=gated_recommendations,
+        job_posting_repository=postings,
+        alert_config_repository=alert_configs,
+        alert_repository=immediate_alerts,
+        telemetry=alert_metrics,
     )
 
     @app.post("/career-sources")
@@ -1603,6 +1723,42 @@ def create_app(
     @app.get("/observability/outbound-metrics")
     def outbound_metrics_endpoint():
         return envelope(data=outbound_metrics.snapshot_metrics())
+
+    @app.get("/immediate-alert-config")
+    def get_immediate_alert_config():
+        return envelope(data=_immediate_alert_config_to_dict(alert_config_service.get()))
+
+    @app.put("/immediate-alert-config")
+    def save_immediate_alert_config(payload: ImmediateAlertConfigRequest):
+        try:
+            config = alert_config_service.save(
+                alert_threshold=payload.alert_threshold,
+                config_version=payload.config_version,
+            )
+        except ImmediateAlertValidationError as exc:
+            return immediate_alert_error_response(exc)
+        return envelope(data=_immediate_alert_config_to_dict(config))
+
+    @app.post("/alerts/immediate/run")
+    def run_immediate_alerts(
+        payload: ImmediateAlertRunRequest | None = None,
+        x_correlation_id: str = Header(default="local"),
+    ):
+        request = payload or ImmediateAlertRunRequest()
+        result = immediate_alert_service.run(
+            correlation_id=x_correlation_id,
+            run_context=request.run_context,
+        )
+        return _immediate_alert_result_response(result, correlation_id=x_correlation_id)
+
+    @app.get("/alerts/immediate")
+    def list_immediate_alerts():
+        items = [_immediate_alert_to_dict(item) for item in immediate_alert_service.list_alerts()]
+        return envelope(data=items)
+
+    @app.get("/observability/immediate-alert-metrics")
+    def immediate_alert_metrics_endpoint():
+        return envelope(data=alert_metrics.snapshot_metrics())
 
     return app
 
