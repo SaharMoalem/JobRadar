@@ -60,8 +60,15 @@ from src.adapters.persistence.in_memory_immediate_alert_adapter import (
     InMemoryImmediateAlertAdapter,
     InMemoryImmediateAlertConfigAdapter,
 )
+from src.adapters.persistence.in_memory_morning_digest_adapter import (
+    InMemoryMorningDigestAdapter,
+    InMemoryMorningDigestConfigAdapter,
+)
 from src.adapters.observability.structured_immediate_alert_telemetry_adapter import (
     StructuredImmediateAlertTelemetryAdapter,
+)
+from src.adapters.observability.structured_morning_digest_telemetry_adapter import (
+    StructuredMorningDigestTelemetryAdapter,
 )
 from src.adapters.drafts.rule_based_draft_artifact_generator import (
     RuleBasedDraftArtifactGeneratorAdapter,
@@ -89,6 +96,8 @@ from src.application.use_cases.generate_draft_artifact import GenerateDraftArtif
 from src.application.use_cases.outbound_approval import ApproveOutboundUseCase, DeliverOutboundUseCase
 from src.application.use_cases.immediate_alert_config import ImmediateAlertConfigService
 from src.application.use_cases.trigger_immediate_alerts import TriggerImmediateAlertsUseCase
+from src.application.use_cases.morning_digest_config import MorningDigestConfigService
+from src.application.use_cases.generate_morning_digest import GenerateMorningDigestUseCase
 from src.application.use_cases.user_profile import UserProfileService
 from src.application.use_cases.source_compliance import SourceComplianceService
 from src.domain.crawl import CrawlRunResult, SourceCrawlOutcome, SourceCrawlStatus
@@ -102,6 +111,11 @@ from src.domain.immediate_alert import (
     ImmediateAlertBatchResult,
     ImmediateAlertFailure,
     ImmediateAlertValidationError,
+)
+from src.domain.morning_digest import (
+    MorningDigestFailure,
+    MorningDigestResult,
+    MorningDigestValidationError,
 )
 from src.domain.match_scoring import ScoringBatchResult, ScoringFailure
 from src.ports.draft_artifact_port import DraftArtifactGeneratorPort
@@ -157,6 +171,11 @@ ERROR_STATUS_BY_CODE: dict[str, int] = {
     "ALERT_THRESHOLD_OUT_OF_RANGE": 400,
     "ALERT_CORRELATION_ID_REQUIRED": 400,
     "ALERT_RUN_CONTEXT_INVALID": 400,
+    "DIGEST_THRESHOLD_OUT_OF_RANGE": 400,
+    "DIGEST_WINDOW_INVALID": 400,
+    "DIGEST_TOP_N_OUT_OF_RANGE": 400,
+    "DIGEST_CORRELATION_ID_REQUIRED": 400,
+    "DIGEST_RUN_CONTEXT_INVALID": 400,
 }
 
 
@@ -535,6 +554,50 @@ class ImmediateAlertBatchResponse(BaseModel):
     skipped_missing_posting_count: int
     run_context: str
     alerts: list[ImmediateAlertResponse]
+
+
+class MorningDigestConfigRequest(BaseModel):
+    digest_threshold: int = Field(default=80, ge=0, le=100, strict=True)
+    digest_window_hours: int = Field(default=24, ge=1, le=8760, strict=True)
+    top_n: int = Field(default=5, ge=1, le=10, strict=True)
+    config_version: str = "v1"
+
+
+class MorningDigestConfigResponse(BaseModel):
+    config_version: str
+    digest_threshold: int
+    digest_window_hours: int
+    top_n: int
+
+
+class MorningDigestRunRequest(BaseModel):
+    run_context: str | None = None
+
+
+class DigestJobItemResponse(BaseModel):
+    job_posting_id: str
+    role_summary: str
+    match_score: int
+    deep_link: str
+    lifecycle_state: str
+    transitioned_at: str | None = None
+    rank: int | None = None
+
+
+class MorningDigestResponse(BaseModel):
+    id: str
+    run_context: str
+    correlation_id: str
+    digest_date: str
+    is_noop: bool
+    skipped_below_threshold_count: int
+    skipped_missing_score_count: int
+    skipped_missing_posting_count: int
+    new_items: list[DigestJobItemResponse]
+    updated_items: list[DigestJobItemResponse]
+    expired_items: list[DigestJobItemResponse]
+    top_recommendations: list[DigestJobItemResponse]
+    created_at: str
 
 
 def envelope(*, data=None, error=None, meta=None):
@@ -1090,6 +1153,73 @@ def immediate_alert_error_response(exc: ImmediateAlertValidationError) -> JSONRe
     )
 
 
+def _morning_digest_config_to_dict(config) -> dict:
+    return MorningDigestConfigResponse(
+        config_version=config.config_version,
+        digest_threshold=config.digest_threshold,
+        digest_window_hours=config.digest_window_hours,
+        top_n=config.top_n,
+    ).model_dump()
+
+
+def _digest_job_item_to_dict(item) -> dict:
+    return DigestJobItemResponse(
+        job_posting_id=item.job_posting_id,
+        role_summary=item.role_summary,
+        match_score=item.match_score,
+        deep_link=item.deep_link,
+        lifecycle_state=item.lifecycle_state,
+        transitioned_at=item.transitioned_at.isoformat() if item.transitioned_at else None,
+        rank=item.rank,
+    ).model_dump()
+
+
+def _morning_digest_to_dict(digest) -> dict:
+    return MorningDigestResponse(
+        id=digest.id,
+        run_context=digest.run_context,
+        correlation_id=digest.correlation_id,
+        digest_date=digest.digest_date,
+        is_noop=digest.is_noop,
+        skipped_below_threshold_count=digest.skipped_below_threshold_count,
+        skipped_missing_score_count=digest.skipped_missing_score_count,
+        skipped_missing_posting_count=digest.skipped_missing_posting_count,
+        new_items=[_digest_job_item_to_dict(item) for item in digest.new_items],
+        updated_items=[_digest_job_item_to_dict(item) for item in digest.updated_items],
+        expired_items=[_digest_job_item_to_dict(item) for item in digest.expired_items],
+        top_recommendations=[_digest_job_item_to_dict(item) for item in digest.top_recommendations],
+        created_at=digest.created_at.isoformat(),
+    ).model_dump()
+
+
+def _morning_digest_result_response(
+    result: MorningDigestResult | MorningDigestFailure,
+    *,
+    correlation_id: str,
+):
+    if isinstance(result, MorningDigestFailure):
+        status_code = ERROR_STATUS_BY_CODE.get(result.code, 400)
+        return JSONResponse(
+            status_code=status_code,
+            content=envelope(
+                error={"code": result.code, "message": result.message},
+                meta={"correlation_id": correlation_id},
+            ),
+        )
+    return envelope(
+        data=_morning_digest_to_dict(result.digest),
+        meta={"correlation_id": correlation_id, "run_context": result.run_context},
+    )
+
+
+def morning_digest_error_response(exc: MorningDigestValidationError) -> JSONResponse:
+    status_code = ERROR_STATUS_BY_CODE.get(exc.code, 400)
+    return JSONResponse(
+        status_code=status_code,
+        content=envelope(error={"code": exc.code, "message": str(exc)}),
+    )
+
+
 def _build_normalizer_registry(
     extra_plugins: list[CrawlerPluginPort] | None = None,
 ) -> InMemoryCrawlNormalizerRegistry:
@@ -1137,6 +1267,9 @@ def create_app(
     immediate_alert_config_repository: InMemoryImmediateAlertConfigAdapter | None = None,
     immediate_alert_repository: InMemoryImmediateAlertAdapter | None = None,
     immediate_alert_telemetry: StructuredImmediateAlertTelemetryAdapter | None = None,
+    morning_digest_config_repository: InMemoryMorningDigestConfigAdapter | None = None,
+    morning_digest_repository: InMemoryMorningDigestAdapter | None = None,
+    morning_digest_telemetry: StructuredMorningDigestTelemetryAdapter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JobRadar API")
     repository = InMemoryCareerSourceAdapter()
@@ -1168,6 +1301,9 @@ def create_app(
     alert_configs = immediate_alert_config_repository or InMemoryImmediateAlertConfigAdapter()
     immediate_alerts = immediate_alert_repository or InMemoryImmediateAlertAdapter()
     alert_metrics = immediate_alert_telemetry or StructuredImmediateAlertTelemetryAdapter()
+    digest_configs = morning_digest_config_repository or InMemoryMorningDigestConfigAdapter()
+    morning_digests = morning_digest_repository or InMemoryMorningDigestAdapter()
+    digest_metrics = morning_digest_telemetry or StructuredMorningDigestTelemetryAdapter()
     service = CareerSourceService(
         repository=repository,
         config=SourcePolicyConfig(max_enabled_sources=max_enabled_sources),
@@ -1260,6 +1396,15 @@ def create_app(
         alert_config_repository=alert_configs,
         alert_repository=immediate_alerts,
         telemetry=alert_metrics,
+    )
+    digest_config_service = MorningDigestConfigService(repository=digest_configs)
+    morning_digest_service = GenerateMorningDigestUseCase(
+        job_posting_repository=postings,
+        match_score_repository=match_scores,
+        top_recommendation_repository=top_recommendations,
+        digest_config_repository=digest_configs,
+        digest_repository=morning_digests,
+        telemetry=digest_metrics,
     )
 
     @app.post("/career-sources")
@@ -1759,6 +1904,44 @@ def create_app(
     @app.get("/observability/immediate-alert-metrics")
     def immediate_alert_metrics_endpoint():
         return envelope(data=alert_metrics.snapshot_metrics())
+
+    @app.get("/morning-digest-config")
+    def get_morning_digest_config():
+        return envelope(data=_morning_digest_config_to_dict(digest_config_service.get()))
+
+    @app.put("/morning-digest-config")
+    def save_morning_digest_config(payload: MorningDigestConfigRequest):
+        try:
+            config = digest_config_service.save(
+                digest_threshold=payload.digest_threshold,
+                digest_window_hours=payload.digest_window_hours,
+                top_n=payload.top_n,
+                config_version=payload.config_version,
+            )
+        except MorningDigestValidationError as exc:
+            return morning_digest_error_response(exc)
+        return envelope(data=_morning_digest_config_to_dict(config))
+
+    @app.post("/digests/morning/run")
+    def run_morning_digest(
+        payload: MorningDigestRunRequest | None = None,
+        x_correlation_id: str = Header(default="local"),
+    ):
+        request = payload or MorningDigestRunRequest()
+        result = morning_digest_service.run(
+            correlation_id=x_correlation_id,
+            run_context=request.run_context,
+        )
+        return _morning_digest_result_response(result, correlation_id=x_correlation_id)
+
+    @app.get("/digests/morning")
+    def list_morning_digests():
+        items = [_morning_digest_to_dict(item) for item in morning_digest_service.list_digests()]
+        return envelope(data=items)
+
+    @app.get("/observability/morning-digest-metrics")
+    def morning_digest_metrics_endpoint():
+        return envelope(data=digest_metrics.snapshot_metrics())
 
     return app
 
