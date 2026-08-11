@@ -51,11 +51,19 @@ from src.adapters.persistence.in_memory_application_tracker_adapter import (
     InMemoryApplicationTrackerAdapter,
 )
 from src.adapters.persistence.in_memory_draft_artifact_adapter import InMemoryDraftArtifactAdapter
+from src.adapters.persistence.in_memory_outbound_adapter import (
+    InMemoryOutboundApprovalAdapter,
+    InMemoryOutboundDeliveryAdapter,
+    RecordingOutboundDeliveryAdapter,
+)
 from src.adapters.drafts.rule_based_draft_artifact_generator import (
     RuleBasedDraftArtifactGeneratorAdapter,
 )
 from src.adapters.observability.structured_draft_artifact_telemetry_adapter import (
     StructuredDraftArtifactTelemetryAdapter,
+)
+from src.adapters.observability.structured_outbound_telemetry_adapter import (
+    StructuredOutboundTelemetryAdapter,
 )
 from src.application.ingestion.enrich_crawl_outcome import CrawlNormalizationService
 from src.application.ingestion.normalize_records import NormalizeCrawlRecordsUseCase
@@ -71,6 +79,7 @@ from src.application.use_cases.score_job_postings import ScoreJobPostingsUseCase
 from src.application.use_cases.search_opportunities import SearchOpportunitiesUseCase
 from src.application.use_cases.application_tracker import ApplicationTrackerUseCase
 from src.application.use_cases.generate_draft_artifact import GenerateDraftArtifactUseCase
+from src.application.use_cases.outbound_approval import ApproveOutboundUseCase, DeliverOutboundUseCase
 from src.application.use_cases.user_profile import UserProfileService
 from src.application.use_cases.source_compliance import SourceComplianceService
 from src.domain.crawl import CrawlRunResult, SourceCrawlOutcome, SourceCrawlStatus
@@ -79,8 +88,10 @@ from src.domain.lifecycle import JobLifecycleState
 from src.domain.opportunity_search import OpportunitySearchCriteria, OpportunitySearchValidationError, WorkModel
 from src.domain.application_tracker import TrackerState, TrackerValidationError
 from src.domain.draft_artifact import DraftArtifactKind, DraftArtifactValidationError, DraftGenerationFailure
+from src.domain.outbound_approval import OutboundValidationError
 from src.domain.match_scoring import ScoringBatchResult, ScoringFailure
 from src.ports.draft_artifact_port import DraftArtifactGeneratorPort
+from src.ports.outbound_approval_port import OutboundDeliveryPort
 from src.domain.normalization import NormalizationRejection
 from src.domain.explainability import ExplainabilityBatchResult, ExplainabilityFailure
 from src.domain.precision_policy import (
@@ -125,6 +136,10 @@ ERROR_STATUS_BY_CODE: dict[str, int] = {
     "DRAFT_TRACKER_CONTEXT_INVALID": 409,
     "DRAFT_KIND_INVALID": 400,
     "DRAFT_GENERATION_FAILED": 502,
+    "OUTBOUND_ARTIFACT_NOT_FOUND": 404,
+    "OUTBOUND_ARTIFACT_NOT_DRAFT": 409,
+    "OUTBOUND_APPROVAL_REQUIRED": 409,
+    "OUTBOUND_APPROVAL_MISMATCH": 409,
 }
 
 
@@ -447,6 +462,28 @@ class DraftArtifactResponse(BaseModel):
     is_latest: bool
     correlation_id: str
     created_at: str
+
+
+class OutboundDeliverRequest(BaseModel):
+    artifact_id: str
+    channel: str = "manual_export"
+
+
+class OutboundApprovalResponse(BaseModel):
+    id: str
+    artifact_id: str
+    correlation_id: str
+    approved_at: str
+
+
+class OutboundDeliveryResponse(BaseModel):
+    id: str
+    artifact_id: str
+    approval_id: str
+    channel: str
+    correlation_id: str
+    content_snapshot: str
+    delivered_at: str
 
 
 def envelope(*, data=None, error=None, meta=None):
@@ -918,6 +955,35 @@ def _draft_artifact_to_dict(artifact) -> dict:
     ).model_dump()
 
 
+def outbound_error_response(exc: OutboundValidationError) -> JSONResponse:
+    status_code = ERROR_STATUS_BY_CODE.get(exc.code, 400)
+    return JSONResponse(
+        status_code=status_code,
+        content=envelope(error={"code": exc.code, "message": str(exc)}),
+    )
+
+
+def _outbound_approval_to_dict(approval) -> dict:
+    return OutboundApprovalResponse(
+        id=approval.id,
+        artifact_id=approval.artifact_id,
+        correlation_id=approval.correlation_id,
+        approved_at=approval.approved_at.isoformat(),
+    ).model_dump()
+
+
+def _outbound_delivery_to_dict(delivery) -> dict:
+    return OutboundDeliveryResponse(
+        id=delivery.id,
+        artifact_id=delivery.artifact_id,
+        approval_id=delivery.approval_id,
+        channel=delivery.channel,
+        correlation_id=delivery.correlation_id,
+        content_snapshot=delivery.content_snapshot,
+        delivered_at=delivery.delivered_at.isoformat(),
+    ).model_dump()
+
+
 def _build_normalizer_registry(
     extra_plugins: list[CrawlerPluginPort] | None = None,
 ) -> InMemoryCrawlNormalizerRegistry:
@@ -958,6 +1024,10 @@ def create_app(
     draft_artifact_repository: InMemoryDraftArtifactAdapter | None = None,
     draft_artifact_generator: DraftArtifactGeneratorPort | None = None,
     draft_artifact_telemetry: StructuredDraftArtifactTelemetryAdapter | None = None,
+    outbound_approval_repository: InMemoryOutboundApprovalAdapter | None = None,
+    outbound_delivery_repository: InMemoryOutboundDeliveryAdapter | None = None,
+    outbound_delivery_port: OutboundDeliveryPort | None = None,
+    outbound_telemetry: StructuredOutboundTelemetryAdapter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JobRadar API")
     repository = InMemoryCareerSourceAdapter()
@@ -982,6 +1052,10 @@ def create_app(
     application_trackers = application_tracker_repository or InMemoryApplicationTrackerAdapter()
     draft_artifacts = draft_artifact_repository or InMemoryDraftArtifactAdapter()
     draft_metrics = draft_artifact_telemetry or StructuredDraftArtifactTelemetryAdapter()
+    outbound_approvals = outbound_approval_repository or InMemoryOutboundApprovalAdapter()
+    outbound_deliveries = outbound_delivery_repository or InMemoryOutboundDeliveryAdapter()
+    outbound_metrics = outbound_telemetry or StructuredOutboundTelemetryAdapter()
+    outbound_delivery = outbound_delivery_port or RecordingOutboundDeliveryAdapter()
     service = CareerSourceService(
         repository=repository,
         config=SourcePolicyConfig(max_enabled_sources=max_enabled_sources),
@@ -1054,6 +1128,18 @@ def create_app(
         draft_repository=draft_artifacts,
         generator=draft_artifact_generator or RuleBasedDraftArtifactGeneratorAdapter(),
         telemetry=draft_metrics,
+    )
+    approve_outbound_service = ApproveOutboundUseCase(
+        draft_repository=draft_artifacts,
+        approval_repository=outbound_approvals,
+        telemetry=outbound_metrics,
+    )
+    deliver_outbound_service = DeliverOutboundUseCase(
+        draft_repository=draft_artifacts,
+        approval_repository=outbound_approvals,
+        delivery_port=outbound_delivery,
+        delivery_repository=outbound_deliveries,
+        telemetry=outbound_metrics,
     )
 
     @app.post("/career-sources")
@@ -1477,6 +1563,46 @@ def create_app(
     @app.get("/observability/draft-artifact-metrics")
     def draft_artifact_metrics_endpoint():
         return envelope(data=draft_metrics.snapshot_metrics())
+
+    @app.post("/draft-artifacts/{artifact_id}/approve-outbound")
+    def approve_draft_outbound(artifact_id: str, x_correlation_id: str = Header(default="local")):
+        try:
+            approval = approve_outbound_service.approve(
+                artifact_id,
+                correlation_id=x_correlation_id,
+            )
+        except OutboundValidationError as exc:
+            return outbound_error_response(exc)
+        return envelope(
+            data=_outbound_approval_to_dict(approval),
+            meta={"correlation_id": x_correlation_id},
+        )
+
+    @app.post("/outbound/deliver")
+    def deliver_outbound(payload: OutboundDeliverRequest, x_correlation_id: str = Header(default="local")):
+        try:
+            delivery = deliver_outbound_service.deliver(
+                payload.artifact_id,
+                channel=payload.channel,
+                correlation_id=x_correlation_id,
+            )
+        except OutboundValidationError as exc:
+            return outbound_error_response(exc)
+        return envelope(
+            data=_outbound_delivery_to_dict(delivery),
+            meta={"correlation_id": x_correlation_id},
+        )
+
+    @app.get("/outbound/deliveries")
+    def list_outbound_deliveries():
+        items = [
+            _outbound_delivery_to_dict(item) for item in deliver_outbound_service.list_deliveries()
+        ]
+        return envelope(data=items)
+
+    @app.get("/observability/outbound-metrics")
+    def outbound_metrics_endpoint():
+        return envelope(data=outbound_metrics.snapshot_metrics())
 
     return app
 
