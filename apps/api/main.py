@@ -50,6 +50,13 @@ from src.adapters.persistence.in_memory_opportunity_filter_state_adapter import 
 from src.adapters.persistence.in_memory_application_tracker_adapter import (
     InMemoryApplicationTrackerAdapter,
 )
+from src.adapters.persistence.in_memory_draft_artifact_adapter import InMemoryDraftArtifactAdapter
+from src.adapters.drafts.rule_based_draft_artifact_generator import (
+    RuleBasedDraftArtifactGeneratorAdapter,
+)
+from src.adapters.observability.structured_draft_artifact_telemetry_adapter import (
+    StructuredDraftArtifactTelemetryAdapter,
+)
 from src.application.ingestion.enrich_crawl_outcome import CrawlNormalizationService
 from src.application.ingestion.normalize_records import NormalizeCrawlRecordsUseCase
 from src.application.ingestion.track_lifecycle import JobLifecycleService
@@ -63,6 +70,7 @@ from src.application.use_cases.recommendation_gate_config import RecommendationG
 from src.application.use_cases.score_job_postings import ScoreJobPostingsUseCase
 from src.application.use_cases.search_opportunities import SearchOpportunitiesUseCase
 from src.application.use_cases.application_tracker import ApplicationTrackerUseCase
+from src.application.use_cases.generate_draft_artifact import GenerateDraftArtifactUseCase
 from src.application.use_cases.user_profile import UserProfileService
 from src.application.use_cases.source_compliance import SourceComplianceService
 from src.domain.crawl import CrawlRunResult, SourceCrawlOutcome, SourceCrawlStatus
@@ -70,7 +78,9 @@ from src.domain.job_posting import JobPosting
 from src.domain.lifecycle import JobLifecycleState
 from src.domain.opportunity_search import OpportunitySearchCriteria, OpportunitySearchValidationError, WorkModel
 from src.domain.application_tracker import TrackerState, TrackerValidationError
+from src.domain.draft_artifact import DraftArtifactKind, DraftArtifactValidationError, DraftGenerationFailure
 from src.domain.match_scoring import ScoringBatchResult, ScoringFailure
+from src.ports.draft_artifact_port import DraftArtifactGeneratorPort
 from src.domain.normalization import NormalizationRejection
 from src.domain.explainability import ExplainabilityBatchResult, ExplainabilityFailure
 from src.domain.precision_policy import (
@@ -110,6 +120,11 @@ ERROR_STATUS_BY_CODE: dict[str, int] = {
     "TRACKER_TRANSITION_INVALID": 409,
     "TRACKER_TRANSITION_UNCHANGED": 409,
     "TRACKER_STATE_INVALID": 400,
+    "DRAFT_JOB_POSTING_NOT_FOUND": 404,
+    "DRAFT_TRACKER_NOT_FOUND": 409,
+    "DRAFT_TRACKER_CONTEXT_INVALID": 409,
+    "DRAFT_KIND_INVALID": 400,
+    "DRAFT_GENERATION_FAILED": 502,
 }
 
 
@@ -415,6 +430,23 @@ class TrackerTransitionResponse(BaseModel):
     reason: str
     correlation_id: str
     transitioned_at: str
+
+
+class DraftArtifactGenerateRequest(BaseModel):
+    job_posting_id: str
+    kind: str
+
+
+class DraftArtifactResponse(BaseModel):
+    id: str
+    job_posting_id: str
+    kind: str
+    content: str
+    source_reference: str
+    status: str
+    is_latest: bool
+    correlation_id: str
+    created_at: str
 
 
 def envelope(*, data=None, error=None, meta=None):
@@ -864,6 +896,28 @@ def _tracker_transition_to_dict(transition) -> dict:
     ).model_dump()
 
 
+def draft_error_response(exc: DraftArtifactValidationError) -> JSONResponse:
+    status_code = ERROR_STATUS_BY_CODE.get(exc.code, 400)
+    return JSONResponse(
+        status_code=status_code,
+        content=envelope(error={"code": exc.code, "message": str(exc)}),
+    )
+
+
+def _draft_artifact_to_dict(artifact) -> dict:
+    return DraftArtifactResponse(
+        id=artifact.id,
+        job_posting_id=artifact.job_posting_id,
+        kind=artifact.kind.value,
+        content=artifact.content,
+        source_reference=artifact.source_reference,
+        status=artifact.status.value,
+        is_latest=artifact.is_latest,
+        correlation_id=artifact.correlation_id,
+        created_at=artifact.created_at.isoformat(),
+    ).model_dump()
+
+
 def _build_normalizer_registry(
     extra_plugins: list[CrawlerPluginPort] | None = None,
 ) -> InMemoryCrawlNormalizerRegistry:
@@ -901,6 +955,9 @@ def create_app(
     explainability_telemetry: StructuredExplainabilityTelemetryAdapter | None = None,
     opportunity_filter_state_repository: InMemoryOpportunityFilterStateAdapter | None = None,
     application_tracker_repository: InMemoryApplicationTrackerAdapter | None = None,
+    draft_artifact_repository: InMemoryDraftArtifactAdapter | None = None,
+    draft_artifact_generator: DraftArtifactGeneratorPort | None = None,
+    draft_artifact_telemetry: StructuredDraftArtifactTelemetryAdapter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JobRadar API")
     repository = InMemoryCareerSourceAdapter()
@@ -923,6 +980,8 @@ def create_app(
         opportunity_filter_state_repository or InMemoryOpportunityFilterStateAdapter()
     )
     application_trackers = application_tracker_repository or InMemoryApplicationTrackerAdapter()
+    draft_artifacts = draft_artifact_repository or InMemoryDraftArtifactAdapter()
+    draft_metrics = draft_artifact_telemetry or StructuredDraftArtifactTelemetryAdapter()
     service = CareerSourceService(
         repository=repository,
         config=SourcePolicyConfig(max_enabled_sources=max_enabled_sources),
@@ -987,6 +1046,14 @@ def create_app(
     tracker_service = ApplicationTrackerUseCase(
         tracker_repository=application_trackers,
         job_posting_repository=postings,
+    )
+    draft_service = GenerateDraftArtifactUseCase(
+        job_posting_repository=postings,
+        tracker_repository=application_trackers,
+        profile_repository=profiles,
+        draft_repository=draft_artifacts,
+        generator=draft_artifact_generator or RuleBasedDraftArtifactGeneratorAdapter(),
+        telemetry=draft_metrics,
     )
 
     @app.post("/career-sources")
@@ -1340,6 +1407,76 @@ def create_app(
             for transition in tracker_service.list_history(job_posting_id)
         ]
         return envelope(data=items)
+
+    @app.post("/draft-artifacts/generate")
+    def generate_draft_artifact(
+        payload: DraftArtifactGenerateRequest,
+        x_correlation_id: str = Header(default="local"),
+    ):
+        try:
+            kind = DraftArtifactKind(payload.kind.strip().lower())
+        except ValueError:
+            failure = DraftGenerationFailure(
+                code="DRAFT_KIND_INVALID",
+                message=f"Unsupported draft artifact kind: {payload.kind}",
+                correlation_id=x_correlation_id,
+            )
+            draft_metrics.record_failure(failure)
+            return draft_error_response(
+                DraftArtifactValidationError(failure.code, failure.message)
+            )
+        try:
+            artifact = draft_service.generate(
+                job_posting_id=payload.job_posting_id,
+                kind=kind,
+                correlation_id=x_correlation_id,
+            )
+        except DraftArtifactValidationError as exc:
+            return draft_error_response(exc)
+        return envelope(
+            data=_draft_artifact_to_dict(artifact),
+            meta={"correlation_id": x_correlation_id},
+        )
+
+    @app.get("/draft-artifacts")
+    def list_draft_artifacts(job_posting_id: str, kind: str | None = None, latest_only: bool = False):
+        parsed_kind: DraftArtifactKind | None = None
+        if kind is not None:
+            try:
+                parsed_kind = DraftArtifactKind(kind.strip().lower())
+            except ValueError:
+                return draft_error_response(
+                    DraftArtifactValidationError(
+                        "DRAFT_KIND_INVALID",
+                        f"Unsupported draft artifact kind: {kind}",
+                    )
+                )
+        if latest_only:
+            items = draft_service.list_latest_for_posting(job_posting_id)
+            if parsed_kind is not None:
+                items = [item for item in items if item.kind == parsed_kind]
+        else:
+            items = draft_service.list_for_posting(job_posting_id, kind=parsed_kind)
+        return envelope(data=[_draft_artifact_to_dict(item) for item in items])
+
+    @app.get("/draft-artifacts/{artifact_id}")
+    def get_draft_artifact(artifact_id: str):
+        artifact = draft_service.get(artifact_id)
+        if artifact is None:
+            return JSONResponse(
+                status_code=404,
+                content=envelope(
+                    error={
+                        "code": "DRAFT_ARTIFACT_NOT_FOUND",
+                        "message": f"Draft artifact '{artifact_id}' was not found.",
+                    }
+                ),
+            )
+        return envelope(data=_draft_artifact_to_dict(artifact))
+
+    @app.get("/observability/draft-artifact-metrics")
+    def draft_artifact_metrics_endpoint():
+        return envelope(data=draft_metrics.snapshot_metrics())
 
     return app
 
