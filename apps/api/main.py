@@ -70,6 +70,17 @@ from src.adapters.observability.structured_immediate_alert_telemetry_adapter imp
 from src.adapters.observability.structured_morning_digest_telemetry_adapter import (
     StructuredMorningDigestTelemetryAdapter,
 )
+from src.adapters.notification import (
+    InAppNotificationAdapter,
+    NotificationChannelRegistry,
+    RecordingEmailNotificationAdapter,
+)
+from src.adapters.persistence.in_memory_notification_delivery_adapter import (
+    InMemoryNotificationDeliveryAdapter,
+)
+from src.adapters.observability.structured_notification_telemetry_adapter import (
+    StructuredNotificationTelemetryAdapter,
+)
 from src.adapters.drafts.rule_based_draft_artifact_generator import (
     RuleBasedDraftArtifactGeneratorAdapter,
 )
@@ -98,6 +109,7 @@ from src.application.use_cases.immediate_alert_config import ImmediateAlertConfi
 from src.application.use_cases.trigger_immediate_alerts import TriggerImmediateAlertsUseCase
 from src.application.use_cases.morning_digest_config import MorningDigestConfigService
 from src.application.use_cases.generate_morning_digest import GenerateMorningDigestUseCase
+from src.application.use_cases.deliver_notifications import DeliverNotificationsUseCase
 from src.application.use_cases.user_profile import UserProfileService
 from src.application.use_cases.source_compliance import SourceComplianceService
 from src.domain.crawl import CrawlRunResult, SourceCrawlOutcome, SourceCrawlStatus
@@ -116,6 +128,10 @@ from src.domain.morning_digest import (
     MorningDigestFailure,
     MorningDigestResult,
     MorningDigestValidationError,
+)
+from src.domain.notification import (
+    NotificationDeliveryBatchResult,
+    NotificationDeliveryFailure,
 )
 from src.domain.match_scoring import ScoringBatchResult, ScoringFailure
 from src.ports.draft_artifact_port import DraftArtifactGeneratorPort
@@ -176,6 +192,14 @@ ERROR_STATUS_BY_CODE: dict[str, int] = {
     "DIGEST_TOP_N_OUT_OF_RANGE": 400,
     "DIGEST_CORRELATION_ID_REQUIRED": 400,
     "DIGEST_RUN_CONTEXT_INVALID": 400,
+    "NOTIFICATION_KIND_INVALID": 400,
+    "NOTIFICATION_SOURCE_NOT_FOUND": 404,
+    "NOTIFICATION_CHANNEL_UNKNOWN": 400,
+    "NOTIFICATION_CHANNEL_DUPLICATE": 400,
+    "NOTIFICATION_NO_CHANNELS_REGISTERED": 503,
+    "NOTIFICATION_CORRELATION_ID_REQUIRED": 400,
+    "NOTIFICATION_RUN_CONTEXT_INVALID": 400,
+    "NOTIFICATION_PAYLOAD_INVALID": 400,
 }
 
 
@@ -598,6 +622,34 @@ class MorningDigestResponse(BaseModel):
     expired_items: list[DigestJobItemResponse]
     top_recommendations: list[DigestJobItemResponse]
     created_at: str
+
+
+class NotificationDeliverRequest(BaseModel):
+    kind: str
+    run_context: str | None = None
+    source_id: str | None = None
+    channels: list[str] | None = None
+
+
+class NotificationDeliveryResponse(BaseModel):
+    id: str
+    channel_id: str
+    kind: str
+    source_id: str
+    correlation_id: str
+    run_context: str
+    status: str
+    detail: str
+    created_at: str
+
+
+class NotificationDeliveryBatchResponse(BaseModel):
+    delivered_count: int
+    failed_count: int
+    skipped_missing_source_count: int
+    run_context: str
+    kind: str
+    deliveries: list[NotificationDeliveryResponse]
 
 
 def envelope(*, data=None, error=None, meta=None):
@@ -1220,6 +1272,47 @@ def morning_digest_error_response(exc: MorningDigestValidationError) -> JSONResp
     )
 
 
+def _notification_delivery_to_dict(delivery) -> dict:
+    return NotificationDeliveryResponse(
+        id=delivery.id,
+        channel_id=delivery.channel_id,
+        kind=delivery.kind,
+        source_id=delivery.source_id,
+        correlation_id=delivery.correlation_id,
+        run_context=delivery.run_context,
+        status=delivery.status,
+        detail=delivery.detail,
+        created_at=delivery.created_at.isoformat(),
+    ).model_dump()
+
+
+def _notification_result_response(
+    result: NotificationDeliveryBatchResult | NotificationDeliveryFailure,
+    *,
+    correlation_id: str,
+):
+    if isinstance(result, NotificationDeliveryFailure):
+        status_code = ERROR_STATUS_BY_CODE.get(result.code, 400)
+        return JSONResponse(
+            status_code=status_code,
+            content=envelope(
+                error={"code": result.code, "message": result.message},
+                meta={"correlation_id": correlation_id},
+            ),
+        )
+    return envelope(
+        data=NotificationDeliveryBatchResponse(
+            delivered_count=result.delivered_count,
+            failed_count=result.failed_count,
+            skipped_missing_source_count=result.skipped_missing_source_count,
+            run_context=result.run_context,
+            kind=result.kind,
+            deliveries=[_notification_delivery_to_dict(item) for item in result.deliveries],
+        ).model_dump(),
+        meta={"correlation_id": correlation_id},
+    )
+
+
 def _build_normalizer_registry(
     extra_plugins: list[CrawlerPluginPort] | None = None,
 ) -> InMemoryCrawlNormalizerRegistry:
@@ -1270,6 +1363,9 @@ def create_app(
     morning_digest_config_repository: InMemoryMorningDigestConfigAdapter | None = None,
     morning_digest_repository: InMemoryMorningDigestAdapter | None = None,
     morning_digest_telemetry: StructuredMorningDigestTelemetryAdapter | None = None,
+    notification_delivery_repository: InMemoryNotificationDeliveryAdapter | None = None,
+    notification_telemetry: StructuredNotificationTelemetryAdapter | None = None,
+    notification_channel_registry: NotificationChannelRegistry | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JobRadar API")
     repository = InMemoryCareerSourceAdapter()
@@ -1304,6 +1400,13 @@ def create_app(
     digest_configs = morning_digest_config_repository or InMemoryMorningDigestConfigAdapter()
     morning_digests = morning_digest_repository or InMemoryMorningDigestAdapter()
     digest_metrics = morning_digest_telemetry or StructuredMorningDigestTelemetryAdapter()
+    notification_deliveries = (
+        notification_delivery_repository or InMemoryNotificationDeliveryAdapter()
+    )
+    notification_metrics = notification_telemetry or StructuredNotificationTelemetryAdapter()
+    channel_registry = notification_channel_registry or NotificationChannelRegistry(
+        [InAppNotificationAdapter(), RecordingEmailNotificationAdapter()]
+    )
     service = CareerSourceService(
         repository=repository,
         config=SourcePolicyConfig(max_enabled_sources=max_enabled_sources),
@@ -1405,6 +1508,13 @@ def create_app(
         digest_config_repository=digest_configs,
         digest_repository=morning_digests,
         telemetry=digest_metrics,
+    )
+    notification_service = DeliverNotificationsUseCase(
+        alert_repository=immediate_alerts,
+        digest_repository=morning_digests,
+        channel_registry=channel_registry,
+        delivery_repository=notification_deliveries,
+        telemetry=notification_metrics,
     )
 
     @app.post("/career-sources")
@@ -1942,6 +2052,34 @@ def create_app(
     @app.get("/observability/morning-digest-metrics")
     def morning_digest_metrics_endpoint():
         return envelope(data=digest_metrics.snapshot_metrics())
+
+    @app.post("/notifications/deliver")
+    def deliver_notifications(
+        payload: NotificationDeliverRequest,
+        x_correlation_id: str = Header(default="local"),
+    ):
+        result = notification_service.run(
+            kind=payload.kind,
+            correlation_id=x_correlation_id,
+            run_context=payload.run_context,
+            source_id=payload.source_id,
+            channels=payload.channels,
+        )
+        return _notification_result_response(result, correlation_id=x_correlation_id)
+
+    @app.get("/notifications/deliveries")
+    def list_notification_deliveries():
+        items = [_notification_delivery_to_dict(item) for item in notification_service.list_deliveries()]
+        return envelope(data=items)
+
+    @app.get("/notifications/in-app")
+    def list_in_app_notifications():
+        items = [_notification_delivery_to_dict(item) for item in notification_service.list_in_app()]
+        return envelope(data=items)
+
+    @app.get("/observability/notification-metrics")
+    def notification_metrics_endpoint():
+        return envelope(data=notification_metrics.snapshot_metrics())
 
     return app
 
