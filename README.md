@@ -11,7 +11,7 @@ JobRadar crawls approved company career pages, normalizes openings into a canoni
 - Prefer **precision over recall**: only actionable, explainable matches
 - Support drafting (messages, CV notes, interview prep) without auto-sending
 - Notify via channel adapters (in-app + email recording in v1)
-- Operate the platform from a local **React dashboard** (`apps/web`) — planned in Epic 6
+- Operate the platform from a local **React dashboard** (`apps/web`)
 
 **v1 role focus:** junior → mid software roles (backend, fullstack, platform/AI-adjacent), with stack bias toward Python/FastAPI, TypeScript/Node, C++/C#/.NET, and PostgreSQL.
 
@@ -24,9 +24,9 @@ JobRadar crawls approved company career pages, normalizes openings into a canoni
 | Epic 3 — Search, tracker, drafts, outbound approval | Done |
 | Epic 4 — Immediate alerts, morning digest, notification channels | Done |
 | Epic 5 — Docs/ADRs, broader observability, CI gates | Backlog |
-| Epic 6 — Local React web dashboard (`apps/web`) | Backlog |
+| Epic 6 — Local React web dashboard (`apps/web`) | In progress (6.1 shell done) |
 
-Persistence and crawlers currently use **in-memory / stub adapters** suitable for local development and tests. PostgreSQL and production crawlers are architectural targets, not the default runtime yet. The web UI is not scaffolded yet; until Epic 6 lands, use the API (`/docs`) or curl.
+Persistence and crawlers currently use **in-memory / stub adapters** suitable for local development and tests. PostgreSQL and production crawlers are architectural targets, not the default runtime yet. The web shell lives in `apps/web`; feature pages land in stories 6.2–6.5.
 
 ## Architecture
 
@@ -34,7 +34,7 @@ JobRadar follows **Clean Architecture (ports & adapters)** with strict inward de
 
 ```text
 apps/api          → interfaces (HTTP)
-apps/web          → React dashboard (Epic 6; planned)
+apps/web          → React dashboard (Epic 6)
 src/application   → use cases / orchestration
 src/domain        → entities, policies, validation
 src/ports         → contracts (repositories, crawlers, notifications, telemetry)
@@ -76,7 +76,7 @@ flowchart LR
 
 ```text
 apps/api/main.py          FastAPI app + wiring
-apps/web/                 React + TypeScript dashboard (Epic 6 — not created yet)
+apps/web/                 React + TypeScript dashboard (Epic 6.1 shell)
 src/domain/               Domain models & policies
 src/application/          Use cases
 src/ports/                Protocols / ports
@@ -85,35 +85,40 @@ tests/                    unit / contract / integration
 _bmad-output/             Planning & story artifacts (gitignored locally)
 ```
 
-## Frontend (planned — Epic 6)
+## Frontend (Epic 6)
 
-Local-first dashboard in `apps/web` (React + TypeScript per architecture spine). It will call the FastAPI `{data, error, meta}` API — no business logic duplication in the UI.
+Local-first dashboard in `apps/web` (React + TypeScript). It calls the FastAPI `{data, error, meta}` API — no scoring, gating, or notification logic in the UI.
 
-| Story | Scope |
-|-------|--------|
-| 6.1 | Scaffold app shell, routing, shared API client + correlation IDs |
-| 6.2 | Career sources & discovery UI |
-| 6.3 | Opportunities search, recommendations, explainability |
-| 6.4 | Tracker, drafts, human-approved outbound |
-| 6.5 | Alerts, morning digest, in-app notifications |
+| Story | Scope | Status |
+|-------|--------|--------|
+| 6.1 | Scaffold app shell, routing, shared API client + correlation IDs | Done |
+| 6.2 | Career sources & discovery UI | Backlog |
+| 6.3 | Opportunities search, recommendations, explainability | Backlog |
+| 6.4 | Tracker, drafts, human-approved outbound | Backlog |
+| 6.5 | Alerts, morning digest, in-app notifications | Backlog |
 
-**Planned local usage (after 6.1):**
+**Local usage:**
 
 ```bash
 # terminal 1 — API
 uv run uvicorn apps.api.main:app --reload --host 127.0.0.1 --port 8000
 
-# terminal 2 — web (exact package manager TBD in story 6.1)
-cd apps/web && npm install && npm run dev
+# terminal 2 — web
+cd apps/web
+cp .env.example .env   # first time only; default VITE_API_BASE_URL=/api (Vite proxy)
+npm install
+npm run dev
 ```
 
-Until then, use http://127.0.0.1:8000/docs.
+Open http://127.0.0.1:5173. The shell header shows API connection status via `GET /api/career-sources` (proxied to port 8000). Feature pages are placeholders until 6.2–6.5. More detail: `apps/web/README.md`.
+
+API-only docs remain at http://127.0.0.1:8000/docs.
 
 ## Requirements
 
 - Python **3.11+**
 - [uv](https://docs.astral.sh/uv/) (recommended) or any installer that can sync `pyproject.toml`
-- **Node.js 20+** (for `apps/web` once Epic 6 starts)
+- **Node.js 20+** (for `apps/web`)
 
 ## Setup
 

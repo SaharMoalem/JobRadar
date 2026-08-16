@@ -3,6 +3,10 @@ _bmad/
 _bmad-output/
 .agents/
 
+# Node / frontend
+node_modules/
+apps/web/dist/
+
 # Python
 .venv/
 __pycache__/
