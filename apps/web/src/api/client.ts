@@ -103,7 +103,7 @@ export async function apiRequest<T>(
     )
   }
 
-  if (envelope.error?.code) {
+  if (envelope.error?.code && envelope.data == null) {
     throw new ApiClientError(
       envelope.error.code,
       envelope.error.message,
@@ -112,7 +112,7 @@ export async function apiRequest<T>(
     )
   }
 
-  if (!response.ok) {
+  if (!response.ok && envelope.data == null) {
     throw new ApiClientError(
       'HTTP_ERROR',
       `Request failed with HTTP ${response.status}`,
@@ -124,5 +124,6 @@ export async function apiRequest<T>(
   return {
     data: envelope.data as T,
     meta: envelope.meta ?? {},
+    error: envelope.error,
   }
 }

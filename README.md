@@ -24,7 +24,7 @@ JobRadar crawls approved company career pages, normalizes openings into a canoni
 | Epic 3 — Search, tracker, drafts, outbound approval | Done |
 | Epic 4 — Immediate alerts, morning digest, notification channels | Done |
 | Epic 5 — Docs/ADRs, broader observability, CI gates | Backlog |
-| Epic 6 — Local React web dashboard (`apps/web`) | In progress (6.1 shell done) |
+| Epic 6 — Local React web dashboard (`apps/web`) | In progress (6.1–6.2 done) |
 
 Persistence and crawlers currently use **in-memory / stub adapters** suitable for local development and tests. PostgreSQL and production crawlers are architectural targets, not the default runtime yet. The web shell lives in `apps/web`; feature pages land in stories 6.2–6.5.
 
@@ -92,7 +92,7 @@ Local-first dashboard in `apps/web` (React + TypeScript). It calls the FastAPI `
 | Story | Scope | Status |
 |-------|--------|--------|
 | 6.1 | Scaffold app shell, routing, shared API client + correlation IDs | Done |
-| 6.2 | Career sources & discovery UI | Backlog |
+| 6.2 | Career sources & discovery UI | Done |
 | 6.3 | Opportunities search, recommendations, explainability | Backlog |
 | 6.4 | Tracker, drafts, human-approved outbound | Backlog |
 | 6.5 | Alerts, morning digest, in-app notifications | Backlog |
@@ -110,7 +110,7 @@ npm install
 npm run dev
 ```
 
-Open http://127.0.0.1:5173. The shell header shows API connection status via `GET /api/career-sources` (proxied to port 8000). Feature pages are placeholders until 6.2–6.5. More detail: `apps/web/README.md`.
+Open http://127.0.0.1:5173. The shell header shows API connection status via `GET /api/career-sources` (proxied to port 8000). `/sources` is live; other feature pages are placeholders until 6.3–6.5. More detail: `apps/web/README.md`.
 
 API-only docs remain at http://127.0.0.1:8000/docs.
 

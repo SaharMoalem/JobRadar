@@ -145,4 +145,29 @@ describe('apiRequest', () => {
     expect(error).toBeInstanceOf(ApiClientError)
     expect(error).toMatchObject({ code: 'INVALID_RESPONSE', status: 200 })
   })
+
+  it('returns data and error when the envelope includes both', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 502,
+        json: async () => ({
+          data: {
+            source_id: 'src-1',
+            status: 'failed',
+            duration_ms: 9,
+          },
+          error: { code: 'CRAWL_PLUGIN_FAILED', message: 'timeout' },
+          meta: { correlation_id: 'c-out' },
+        }),
+      }),
+    )
+
+    const result = await apiRequest('/career-sources/src-1/execute', { method: 'POST' })
+
+    expect(result.data).toMatchObject({ status: 'failed' })
+    expect(result.error).toEqual({ code: 'CRAWL_PLUGIN_FAILED', message: 'timeout' })
+    expect(result.meta).toEqual({ correlation_id: 'c-out' })
+  })
 })

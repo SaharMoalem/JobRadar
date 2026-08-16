@@ -29,7 +29,7 @@ cd apps/web
 npm run dev
 ```
 
-Open http://127.0.0.1:5173. The shell header shows **Connected** when `GET /career-sources` succeeds.
+Open http://127.0.0.1:5173. The shell header shows **Connected** when `GET /api/career-sources` succeeds. `/sources` manages career sources and discovery.
 
 ## Scripts
 
@@ -37,14 +37,14 @@ Open http://127.0.0.1:5173. The shell header shows **Connected** when `GET /care
 |---------|---------|
 | `npm run dev` | Vite dev server on port 5173 |
 | `npm run build` | Typecheck + production build |
-| `npm test` | Vitest (API client envelope tests) |
+| `npm test` | Vitest (API client + Sources page) |
 | `npm run preview` | Serve the production build |
 
 ## Story map
 
 | Route | Status |
 |-------|--------|
-| `/sources` | Placeholder — story 6.2 |
+| `/sources` | Live — story 6.2 |
 | `/opportunities` | Placeholder — story 6.3 |
 | `/tracker`, `/drafts` | Placeholder — story 6.4 |
 | `/alerts`, `/notifications` | Placeholder — story 6.5 |

@@ -12,6 +12,7 @@ export type ApiEnvelope<T> = {
 export type ApiSuccess<T> = {
   data: T
   meta: Record<string, unknown>
+  error?: ApiErrorBody | null
 }
 
 export type ApiRequestOptions = {
