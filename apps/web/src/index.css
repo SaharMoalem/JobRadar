@@ -177,11 +177,51 @@ a {
 }
 
 .source-form input,
+.source-form select,
 .row-actions input {
   padding: 0.35rem 0.5rem;
   border: 1px solid var(--border);
   background: var(--surface);
   font: inherit;
+}
+
+.lifecycle-set {
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.lifecycle-set legend {
+  font-size: 0.9rem;
+  padding: 0;
+}
+
+/* Must out-specify `.source-form label`, which sets a column layout. */
+.source-form label.checkbox-label,
+.row-actions label.checkbox-label {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.hint {
+  margin: 0.35rem 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.gate-trace {
+  margin: 0.25rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.8rem;
+}
+
+.gate-trace .gate-fail {
+  color: var(--error);
+}
+
+.opportunities-page a {
+  text-decoration: underline;
 }
 
 .form-actions,
