@@ -8,7 +8,16 @@ import {
   useState,
 } from 'react'
 
-import { ApiClientError, isAbortError, newCorrelationId } from '../api/client.ts'
+import { isAbortError, newCorrelationId } from '../api/client.ts'
+import {
+  type LoadState,
+  combinedError,
+  errorMessage,
+  formatDate,
+  rejections,
+  safeHref,
+  splitCsv,
+} from '../lib/ui.ts'
 import {
   FILTER_SESSION_ID,
   LIFECYCLE_STATES,
@@ -36,58 +45,11 @@ import {
   type TopRecommendation,
   type UserProfile,
 } from '../api/opportunities.ts'
-
-type LoadState = 'loading' | 'ready' | 'failed'
+import { bookmarkOpportunity } from '../api/tracker.ts'
 
 const PIPELINE_ORDER = ['scoring', 'gating', 'precision', 'explainability'] as const
 
 type PipelineStage = (typeof PIPELINE_ORDER)[number]
-
-function errorMessage(err: unknown): string {
-  if (err instanceof ApiClientError) {
-    return `${err.code}: ${err.message}`
-  }
-  return 'Request failed'
-}
-
-function combinedError(failures: unknown[]): string | null {
-  if (failures.length === 0) {
-    return null
-  }
-  const first = errorMessage(failures[0])
-  if (failures.length === 1) {
-    return first
-  }
-  return `${first} (and ${failures.length - 1} more request${failures.length > 2 ? 's' : ''} failed)`
-}
-
-function rejections(results: PromiseSettledResult<unknown>[]): unknown[] {
-  return results
-    .filter((item): item is PromiseRejectedResult => item.status === 'rejected')
-    .map((item) => item.reason)
-}
-
-function splitCsv(value: string): string[] {
-  return value
-    .split(',')
-    .map((part) => part.trim())
-    .filter(Boolean)
-}
-
-function formatPostedAt(value: string): string {
-  const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleDateString()
-}
-
-/** Postings come from crawled pages, so only navigable web schemes are rendered as links. */
-function safeHref(raw: string): string | null {
-  try {
-    const parsed = new URL(raw, window.location.origin)
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : null
-  } catch {
-    return null
-  }
-}
 
 function staleStagesNote(stage: PipelineStage): string {
   const downstream = PIPELINE_ORDER.slice(PIPELINE_ORDER.indexOf(stage) + 1)
@@ -110,6 +72,8 @@ export function OpportunitiesPage() {
   const [locations, setLocations] = useState('')
   const [languages, setLanguages] = useState('')
   const [seniority, setSeniority] = useState('')
+  // Confirmed bookmarks only, so the label never claims a write the API did not accept.
+  const [bookmarked, setBookmarked] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
   const [runSummary, setRunSummary] = useState<string | null>(null)
   const [initializing, setInitializing] = useState(true)
@@ -270,6 +234,23 @@ export function OpportunitiesPage() {
     void runAction(async () => {
       await saveFilterState(form)
       setRunSummary(`Filters saved for session ${FILTER_SESSION_ID}.`)
+    })
+  }
+
+  /** The tracker's entry point: a posting id is never shown, so it is bookmarked from here. */
+  function onBookmark(jobPostingId: string, title: string) {
+    void runAction(async () => {
+      const result = await bookmarkOpportunity(jobPostingId, newCorrelationId())
+      if (!result.data) {
+        setError(`${title} may have been bookmarked, but the API returned no record.`)
+        return
+      }
+      setBookmarked((current) =>
+        current.includes(jobPostingId) ? current : [...current, jobPostingId],
+      )
+      setRunSummary(
+        `Bookmarked ${title} in state ${result.data.tracker_state}. Move it on the Tracker page.`,
+      )
     })
   }
 
@@ -485,7 +466,7 @@ export function OpportunitiesPage() {
               <li key={item.job_posting_id}>
                 <strong>{item.title}</strong> · {item.company} · {item.location} · score{' '}
                 {item.match_score ?? '—'} · {item.lifecycle_state}
-                {item.posted_at ? ` · ${formatPostedAt(item.posted_at)}` : ''}
+                {item.posted_at ? ` · ${formatDate(item.posted_at)}` : ''}
                 {href ? (
                   <>
                     {' '}
@@ -495,6 +476,15 @@ export function OpportunitiesPage() {
                     </a>
                   </>
                 ) : null}
+                <div className="row-actions">
+                  <button
+                    type="button"
+                    disabled={busy || bookmarked.includes(item.job_posting_id)}
+                    onClick={() => onBookmark(item.job_posting_id, item.title)}
+                  >
+                    {bookmarked.includes(item.job_posting_id) ? 'Bookmarked' : 'Bookmark'}
+                  </button>
+                </div>
               </li>
             )
           })}

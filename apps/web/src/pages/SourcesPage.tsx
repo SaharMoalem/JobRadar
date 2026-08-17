@@ -1,6 +1,6 @@
 import { type FormEvent, useCallback, useEffect, useState } from 'react'
 
-import { ApiClientError, isAbortError } from '../api/client.ts'
+import { isAbortError } from '../api/client.ts'
 import {
   approveCompliance,
   createSource,
@@ -18,13 +18,7 @@ import {
   type JobPosting,
   type SourceWritePayload,
 } from '../api/sources.ts'
-
-function errorMessage(err: unknown): string {
-  if (err instanceof ApiClientError) {
-    return `${err.code}: ${err.message}`
-  }
-  return 'Request failed'
-}
+import { errorMessage } from '../lib/ui.ts'
 
 function defaultForm(source?: CareerSource): SourceWritePayload {
   return {

@@ -220,6 +220,42 @@ a {
   color: var(--error);
 }
 
+.tracker-row,
+.draft-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.6rem 0;
+  border-top: 1px solid var(--border);
+}
+
+.tracker-state {
+  font-family: ui-monospace, monospace;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 0 0.3rem;
+}
+
+.tracker-history {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.tracker-history ol {
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
+.draft-content {
+  margin: 0;
+  padding: 0.6rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .opportunities-page a {
   text-decoration: underline;
 }

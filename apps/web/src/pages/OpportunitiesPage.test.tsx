@@ -443,4 +443,52 @@ describe('OpportunitiesPage', () => {
     expect(await screen.findByText('Platform Engineer')).toBeTruthy()
     expect(screen.queryByText('job-9')).toBeNull()
   })
+
+  it('bookmarks a result row through POST /tracker/bookmarks', async () => {
+    const user = userEvent.setup()
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue(
+      'bookmark-cid' as ReturnType<typeof crypto.randomUUID>,
+    )
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      const path = String(url)
+      const method = (init?.method ?? 'GET').toUpperCase()
+      if (path.includes('/opportunities/search') && method === 'POST') {
+        return Promise.resolve(
+          jsonResponse({ items: [sampleItem], total_count: 1, empty: false }),
+        )
+      }
+      if (path.endsWith('/tracker/bookmarks') && method === 'POST') {
+        return Promise.resolve(
+          jsonResponse({
+            job_posting_id: 'job-1',
+            tracker_state: 'new',
+            bookmarked: true,
+            bookmarked_at: '2026-08-16T12:00:00+00:00',
+            updated_at: '2026-08-16T12:00:00+00:00',
+          }),
+        )
+      }
+      return defaultFetch(url, init)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<OpportunitiesPage />)
+    expect(await screen.findByText('Backend Engineer')).toBeTruthy()
+
+    await user.click(screen.getByRole('button', { name: 'Bookmark' }))
+
+    await waitFor(() => {
+      const call = findCall(fetchMock.mock.calls, '/tracker/bookmarks')
+      expect(call).toBeTruthy()
+      expect(bodyOf(call)).toEqual({ job_posting_id: 'job-1' })
+      const headers = (call?.[1] as RequestInit | undefined)?.headers as
+        | Record<string, string>
+        | undefined
+      expect(headers?.['X-Correlation-Id']).toBe('bookmark-cid')
+    })
+    expect(await screen.findByRole('status')).toBeTruthy()
+    expect(
+      (screen.getByRole('button', { name: 'Bookmarked' }) as HTMLButtonElement).disabled,
+    ).toBe(true)
+  })
 })
