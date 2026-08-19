@@ -221,7 +221,8 @@ a {
 }
 
 .tracker-row,
-.draft-row {
+.draft-row,
+.digest-row {
   display: flex;
   flex-direction: column;
   gap: 0.4rem;

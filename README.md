@@ -85,7 +85,7 @@ npm install
 npm run dev
 ```
 
-Open http://127.0.0.1:5173. The shell header shows API connection status via `GET /api/career-sources` (proxied to port 8000). `/sources`, `/opportunities`, `/tracker`, and `/drafts` are live; alerts and notifications stay placeholders until 6.5. More detail: `apps/web/README.md`.
+Open http://127.0.0.1:5173. The shell header shows API connection status via `GET /api/career-sources` (proxied to port 8000). `/sources`, `/opportunities`, `/tracker`, `/drafts`, `/alerts`, and `/notifications` are live. More detail: `apps/web/README.md`.
 
 API-only docs remain at http://127.0.0.1:8000/docs.
 
