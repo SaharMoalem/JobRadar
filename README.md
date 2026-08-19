@@ -15,19 +15,6 @@ JobRadar crawls approved company career pages, normalizes openings into a canoni
 
 **v1 role focus:** junior → mid software roles (backend, fullstack, platform/AI-adjacent), with stack bias toward Python/FastAPI, TypeScript/Node, C++/C#/.NET, and PostgreSQL.
 
-## Current status
-
-| Area | Status |
-|------|--------|
-| Epic 1 — Sources, crawl, normalize, dedup, lifecycle | Done |
-| Epic 2 — Match score, gating, precision, explainability | Done |
-| Epic 3 — Search, tracker, drafts, outbound approval | Done |
-| Epic 4 — Immediate alerts, morning digest, notification channels | Done |
-| Epic 5 — Docs/ADRs, broader observability, CI gates | Backlog |
-| Epic 6 — Local React web dashboard (`apps/web`) | In progress (6.1–6.4 done) |
-
-Persistence and crawlers currently use **in-memory / stub adapters** suitable for local development and tests. PostgreSQL and production crawlers are architectural targets, not the default runtime yet. The web shell lives in `apps/web`; feature pages land in stories 6.2–6.5.
-
 ## Architecture
 
 JobRadar follows **Clean Architecture (ports & adapters)** with strict inward dependencies:
