@@ -72,18 +72,6 @@ tests/                    unit / contract / integration
 _bmad-output/             Planning & story artifacts (gitignored locally)
 ```
 
-## Frontend (Epic 6)
-
-Local-first dashboard in `apps/web` (React + TypeScript). It calls the FastAPI `{data, error, meta}` API — no scoring, gating, or notification logic in the UI.
-
-| Story | Scope | Status |
-|-------|--------|--------|
-| 6.1 | Scaffold app shell, routing, shared API client + correlation IDs | Done |
-| 6.2 | Career sources & discovery UI | Done |
-| 6.3 | Opportunities search, recommendations, explainability | Done |
-| 6.4 | Tracker, drafts, human-approved outbound | Done |
-| 6.5 | Alerts, morning digest, in-app notifications | Backlog |
-
 **Local usage:**
 
 ```bash
